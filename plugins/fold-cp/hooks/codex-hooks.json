@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-rules.sh\"",
+            "timeout": 5,
+            "statusMessage": "Loading fold-cp CP hard rules..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/codex_guard.py\"",
+            "timeout": 5,
+            "statusMessage": "fold-cp guard (serial / test-timeout)..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -99,7 +99,18 @@ def cdist_pde_reference(
 @pytest.mark.parametrize("mask_col_has_mul", [False, True], ids=lambda x: f"MaskColMul:{x}")
 @pytest.mark.parametrize("all_zero_mask", [False, True], ids=lambda x: f"AllZeroMask:{x}")
 def test_cdist_pde_correctness(B, multiplicity, N_row, N_col, mask_row_has_mul, mask_col_has_mul, all_zero_mask):
-    """Test forward and backward pass correctness against reference implementation."""
+    """Test forward and backward pass correctness against reference implementation.
+
+    Confidence training is an fp32-coords-only path by design: both the serial
+    ``get_target_pde`` (boltz/model/loss/confidencev2.py) and the distributed
+    ``_PDELossImpl.forward`` wrap their coord/mask projection in
+    ``autocast(enabled=False)``, so coords reach this kernel as fp32+.
+    The kernel keeps a defensive bf16→fp32 upcast as a safety net against
+    future callers violating that contract, but ``bfloat16`` is not exercised
+    here because the Python reference does not replicate the upcast and would
+    diverge by ~1 bin index near bin boundaries (off-by-one bin from bf16
+    rounding of ``target_pde * num_bins / max_dist``).
+    """
     device = torch.device("cuda")
     B_mul = B * multiplicity
     num_bins = 64

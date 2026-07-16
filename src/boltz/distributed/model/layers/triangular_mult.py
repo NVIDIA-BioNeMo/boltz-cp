@@ -453,8 +453,34 @@ class _TriangleMultiplicationImpl(torch.autograd.Function):
 
         ctx.mark_non_differentiable(mask)
 
-        # Apply mask and prepare for computation
-        mask_local = mask.to_local().unsqueeze(-1)
+        # Apply mask and prepare for computation.
+        #
+        # Cast mask to ``x``'s dtype before any arithmetic.  ``mask`` is a
+        # boolean-equivalent gating tensor whose precision is meaningless, yet
+        # the production data pipeline materialises it as FP32 (see
+        # ``pair_mask = feats["token_pair_pad_mask"].to(dtype=z.dtype)`` in
+        # ``boltz/distributed/model/models/boltz2.py`` where ``z.dtype`` is
+        # FP32, mirroring ``compute_dtype = promote_types(s_init.dtype, FP32)``
+        # in the serial trunk).  Under ``bf16-mixed`` autocast ``x``/``g`` are
+        # BF16 (Linear outputs), so the out-of-place ``BF16 * FP32`` below
+        # would type-promote ``x_local`` to FP32 and cascade through the
+        # autograd function:
+        #
+        # * forward output becomes FP32 (the ``_distributed_bmm`` accumulator
+        #   is seeded by ``zeros_like(lhs)`` so the FP32 ``a_local`` poisons
+        #   the result even though ``matmul`` itself autocasts to BF16);
+        # * the saved ``a_local``/``b_local``/``x_masked_gated_local`` are FP32
+        #   so ``dg_local = dab_local * x_masked_gated_local`` in backward
+        #   computes a FP32 gradient at ``g`` — diverging from the serial
+        #   reference whose final trimul output is BF16 under autocast and
+        #   whose input ``g`` is BF16.
+        #
+        # ``custom_fwd(device_type="cuda")`` with the default ``cast_inputs=None``
+        # *inherits* the calling autocast state rather than disabling it, but
+        # autocast handles only registered ops (matmul/einsum/linear); the
+        # element-wise ``*`` here falls back to torch type promotion and must
+        # be handled explicitly.
+        mask_local = mask.to_local().to(dtype=x.dtype).unsqueeze(-1)
         g_local = g.to_local().sigmoid()
         x_local = x.to_local() * mask_local
         x_local *= g_local

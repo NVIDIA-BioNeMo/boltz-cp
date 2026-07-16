@@ -483,10 +483,6 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912
     if offload_actv_ckpt_cfg is not None:
         model_module.apply(OffloadActvCkptToCPU(set(offload_actv_ckpt_cfg)))
 
-    if getattr(model_module, "confidence_prediction", False):
-        model_module.confidence_prediction = False
-        warnings.warn("Confidence prediction is not supported in distributed training mode")
-
     steering_args = getattr(model_module, "steering_args", None)
     if steering_args is not None:
         for attr in ("fk_steering", "guidance_update"):

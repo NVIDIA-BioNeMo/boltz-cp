@@ -119,11 +119,24 @@ class DistributedValidator(Validator):
             for val_idx in range(self.num_val_datasets):
                 self.folding_metrics["rmsd"][val_idx]["rmsd"] = MeanMetric()
 
+        self._clash_score_metric_names = (
+            "clash_atoms_count",
+            "clash_atoms_fraction",
+            "clash_atoms_count_intra",
+            "clash_atoms_fraction_intra",
+            "clash_atoms_count_inter",
+            "clash_atoms_fraction_inter",
+            "clash_atoms_count_inter_homo",
+            "clash_atoms_fraction_inter_homo",
+            "clash_atoms_count_inter_hetero",
+            "clash_atoms_fraction_inter_hetero",
+        )
+
         if clash_score_metrics:
             self.folding_metrics["clash_score"] = nn.ModuleList([nn.ModuleDict() for _ in range(self.num_val_datasets)])
             for val_idx in range(self.num_val_datasets):
-                self.folding_metrics["clash_score"][val_idx]["clash_atoms_count"] = MeanMetric()
-                self.folding_metrics["clash_score"][val_idx]["clash_atoms_fraction"] = MeanMetric()
+                for m_name in self._clash_score_metric_names:
+                    self.folding_metrics["clash_score"][val_idx][m_name] = MeanMetric()
 
         # In our CP code, lightning is blind to our distributed computation context
         # so MeanMetric is strictly single device and we should not rely on
@@ -314,6 +327,7 @@ class DistributedValidator(Validator):
         batch_gathered["asym_id"] = batch_gathered["asym_id"][:, token_pad_mask_1d]
         batch_gathered["token_pad_mask"] = batch_gathered["token_pad_mask"][:, token_pad_mask_1d]
         batch_gathered["atom_pad_mask"] = batch_gathered["atom_pad_mask"][:, atom_pad_mask_1d]
+        batch_gathered["atom_resolved_mask"] = batch_gathered["atom_resolved_mask"][:, atom_pad_mask_1d]
         out_gathered["sample_atom_coords"] = out_gathered["sample_atom_coords"][:, atom_pad_mask_1d]
 
         K = batch["coords"].shape[1]  # ensemble dim is not sharded
@@ -349,6 +363,17 @@ class DistributedValidator(Validator):
         if frames_idx_gathered.ndim == 4:
             # (B, E=1, T_padded, 3) → squeeze ensemble dim → (B, T_padded, 3)
             frames_idx_gathered = frames_idx_gathered.squeeze(1)
+        # frames_idx values are atom indices in the *padded* CP layout produced by
+        # remap_atom_indices_unpadded_to_padded. After atom_pad_mask masking,
+        # atom_coords is dense (real atoms only), so padded indices would overflow.
+        # Build a padded→masked index map and apply it before token masking.
+        # The featurizer guarantees frames_idx ∈ [0, N_padded) and points at real
+        # atoms for real tokens; padded-token entries are discarded by the
+        # token_pad_mask filter below, so no clamping is needed here.
+        # int32 is sufficient: cumsum value is bounded by N_atoms_padded (≪ 2³¹),
+        # and PyTorch advanced indexing accepts any integer dtype.
+        padded_to_masked = atom_pad_mask_1d.cumsum(0, dtype=torch.int32) - 1
+        frames_idx_gathered = padded_to_masked[frames_idx_gathered]
         batch_gathered["frames_idx"] = frames_idx_gathered[:, token_pad_mask_1d]
 
         frame_resolved_mask_gathered = gather_along_cp(batch["frame_resolved_mask"])
@@ -427,6 +452,7 @@ class DistributedValidator(Validator):
                     batch_gathered["frame_resolved_mask"],
                     batch_gathered["token_pad_mask"],
                     batch_gathered["atom_pad_mask"],
+                    batch_gathered["atom_resolved_mask"],
                     batch_gathered["token_pad_mask_1d"],
                     batch_gathered["atom_pad_mask_1d"],
                     out_gathered["sample_atom_coords"],
@@ -515,7 +541,7 @@ class DistributedValidator(Validator):
                 dataset_name_ori = self.val_names[idx_dataset]
                 dataset_name = "" if dataset_name_ori == "RCSB" else f"__{dataset_name_ori}"
                 if self.clash_score_metrics:
-                    for m in ("clash_atoms_count", "clash_atoms_fraction"):
+                    for m in self._clash_score_metric_names:
                         val = self.folding_metrics["clash_score"][idx_dataset][m].compute()
                         val = 0.0 if torch.isnan(val) else val.item()
                         self.folding_metrics["clash_score"][idx_dataset][m].reset()
@@ -593,9 +619,11 @@ class DistributedValidator(Validator):
         asym_id = gather_along_cp(batch["asym_id"])
         sample_atom_coords = gather_along_cp(out["sample_atom_coords"])
 
+        atom_resolved_mask = gather_along_cp(batch["atom_resolved_mask"])
         batch_gathered = {
             "token_pad_mask": token_pad_mask,
             "atom_pad_mask": atom_pad_mask,
+            "atom_resolved_mask": atom_resolved_mask,
             "token_pad_mask_1d": token_pad_mask_1d,
             "atom_pad_mask_1d": atom_pad_mask_1d,
             "mol_type": mol_type,
@@ -684,14 +712,18 @@ class DistributedValidator(Validator):
                         batch["token_to_rep_atom"],
                     )
                 )
-                clash_count, clash_frac = clash_score(
+                entity_id = gather_along_cp(batch["entity_id"])
+                clash_dict = clash_score(
                     coords_repr=coords_repr,
                     token_pad_mask=token_pad_mask,
                     multiplicity=n_samples,
                     clash_cutoff=clash_cutoff,
+                    asym_id=asym_id,
+                    entity_id=entity_id,
                 )
-                self.folding_metrics["clash_score"][idx_dataset]["clash_atoms_count"].update(clash_count.mean())
-                self.folding_metrics["clash_score"][idx_dataset]["clash_atoms_fraction"].update(clash_frac.mean())
+                for m_name in self._clash_score_metric_names:
+                    if m_name in clash_dict:
+                        self.folding_metrics["clash_score"][idx_dataset][m_name].update(clash_dict[m_name].mean())
 
         # Update folding metrics
         self.update_lddt_rmsd_metrics(

@@ -40,6 +40,7 @@ from boltz.distributed.model.loss.diffusion import (
     weighted_rigid_align as dtensor_weighted_rigid_align,
 )
 from boltz.distributed.model.loss.triton.cdist_lddt import cdist_lddt
+from boltz.distributed.model.loss.triton.clash_denom import clash_denom_grouped
 from boltz.distributed.model.validation.utils import gather_along_cp
 from boltz.model.loss.confidence import (
     lddt_dist,
@@ -51,8 +52,15 @@ def clash_score(
     token_pad_mask: torch.Tensor,
     multiplicity: int,
     clash_cutoff: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    asym_id: torch.Tensor | None = None,
+    entity_id: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
     """Compute per-sample token clash count and fraction from representative atom coordinates.
+
+    When ``asym_id`` and ``entity_id`` are provided the result is segregated
+    into intra-chain, inter-chain, homomeric inter-chain (same ``entity_id``,
+    different ``asym_id``), and heteromeric inter-chain (different
+    ``entity_id``) categories.  The total score is always returned.
 
     Parameters
     ----------
@@ -64,36 +72,103 @@ def clash_score(
         Diffusion multiplicity.
     clash_cutoff : float
         Distance cutoff for defining a clash in Angstrom.
+    asym_id : torch.Tensor | None
+        Per-token chain identifier, shape ``[B, N_tokens]``.  Required for
+        inter/intra segregation.
+    entity_id : torch.Tensor | None
+        Per-token entity identifier, shape ``[B, N_tokens]``.  Required for
+        homomeric/heteromeric segregation.
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor]
-        - clash_atoms_count: clashing tokens per sample, shape ``[B*mul]``
-        - clash_atoms_fraction: fraction of clashing valid tokens, shape ``[B*mul]``
-    """
-    _, _, clash_denom = cdist_lddt(
-        pred_coords_row=coords_repr,
-        pred_coords_col=coords_repr,
-        true_coords_row=coords_repr,
-        true_coords_col=coords_repr,
-        mask_row=token_pad_mask.float(),
-        mask_col=token_pad_mask.float(),
-        multiplicity=multiplicity,
-        cutoff=clash_cutoff,
-        do_mask_diagonal=True,
-        per_atom=True,
-        return_denom=True,
-    )
-    B = token_pad_mask.shape[0]
-    clash_denom_reshaped = clash_denom.reshape(B, multiplicity, -1)
-    token_mask_bc = token_pad_mask[:, None, :]
+    dict[str, torch.Tensor]
+        Keys (each value shape ``[B*mul]``):
+        - ``clash_atoms_count`` / ``clash_atoms_fraction`` -- total
+        - ``clash_atoms_count_intra`` / ``clash_atoms_fraction_intra``
+        - ``clash_atoms_count_inter`` / ``clash_atoms_fraction_inter``
+        - ``clash_atoms_count_inter_homo`` / ``clash_atoms_fraction_inter_homo``
+        - ``clash_atoms_count_inter_hetero`` / ``clash_atoms_fraction_inter_hetero``
 
-    clash_atoms_count_2d = ((clash_denom_reshaped > 0) & token_mask_bc).sum(dim=2)
+        When ``asym_id`` / ``entity_id`` are *None* the segregated keys are
+        omitted and only the total keys are returned.
+    """
+
+    B = token_pad_mask.shape[0]
+    N = token_pad_mask.shape[1]
+    pad_float = token_pad_mask.float()
+    token_mask_bc = token_pad_mask[:, None, :]
     clash_atoms_total = token_pad_mask.sum(dim=1).clamp(min=1)[:, None]
 
-    clash_atoms_count = clash_atoms_count_2d.reshape(-1)
-    clash_atoms_fraction = (clash_atoms_count_2d / clash_atoms_total).reshape(-1)
-    return clash_atoms_count, clash_atoms_fraction
+    def _count_and_fraction(denom_reshaped):
+        """Convert per-token denom ``[B, mul, N]`` to ``(count, fraction)`` each ``[B*mul]``."""
+        count_2d = ((denom_reshaped > 0) & token_mask_bc).sum(dim=2)
+        count = count_2d.reshape(-1)
+        fraction = (count_2d / clash_atoms_total).reshape(-1)
+        return count, fraction
+
+    if asym_id is None or entity_id is None:
+        # Total-only path via cdist_lddt (no group information available).
+        _, _, total_denom_flat = cdist_lddt(
+            pred_coords_row=coords_repr,
+            pred_coords_col=coords_repr,
+            true_coords_row=coords_repr,
+            true_coords_col=coords_repr,
+            mask_row=pad_float,
+            mask_col=pad_float,
+            multiplicity=multiplicity,
+            cutoff=clash_cutoff,
+            do_mask_diagonal=True,
+            per_atom=True,
+            return_denom=True,
+        )
+        total_denom = total_denom_flat.reshape(B, multiplicity, N)
+        total_count, total_frac = _count_and_fraction(total_denom)
+        return {
+            "clash_atoms_count": total_count,
+            "clash_atoms_fraction": total_frac,
+        }
+
+    # Single-pass grouped kernel: total, same-chain, same-entity denoms.
+    total_denom_flat, chain_denom_flat, entity_denom_flat = clash_denom_grouped(
+        coords=coords_repr,
+        mask=pad_float,
+        chain_id=asym_id,
+        entity_id=entity_id,
+        multiplicity=multiplicity,
+        cutoff=clash_cutoff,
+    )
+
+    total_denom = total_denom_flat.reshape(B, multiplicity, N)
+    intra_denom = chain_denom_flat.reshape(B, multiplicity, N)
+    entity_denom = entity_denom_flat.reshape(B, multiplicity, N)
+
+    inter_denom = total_denom - intra_denom
+    homo_denom = entity_denom - intra_denom
+    hetero_denom = inter_denom - homo_denom
+
+    result: dict[str, torch.Tensor] = {}
+
+    total_count, total_frac = _count_and_fraction(total_denom)
+    result["clash_atoms_count"] = total_count
+    result["clash_atoms_fraction"] = total_frac
+
+    intra_count, intra_frac = _count_and_fraction(intra_denom)
+    result["clash_atoms_count_intra"] = intra_count
+    result["clash_atoms_fraction_intra"] = intra_frac
+
+    inter_count, inter_frac = _count_and_fraction(inter_denom)
+    result["clash_atoms_count_inter"] = inter_count
+    result["clash_atoms_fraction_inter"] = inter_frac
+
+    homo_count, homo_frac = _count_and_fraction(homo_denom)
+    result["clash_atoms_count_inter_homo"] = homo_count
+    result["clash_atoms_fraction_inter_homo"] = homo_frac
+
+    hetero_count, hetero_frac = _count_and_fraction(hetero_denom)
+    result["clash_atoms_count_inter_hetero"] = hetero_count
+    result["clash_atoms_fraction_inter_hetero"] = hetero_frac
+
+    return result
 
 
 def factored_lddt_loss(

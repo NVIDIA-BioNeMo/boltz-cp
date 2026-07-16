@@ -36,6 +36,8 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from boltz.data import const
 from boltz.distributed.comm import TransposeComm
+from boltz.distributed.data.feature.featurizer import pad_and_scatter_atom_features_dtensor
+from boltz.distributed.data.module.placements import TRAINING_FEATURE_PLACEMENTS_V2
 from boltz.distributed.manager import DistributedManager
 from boltz.distributed.model.validation.rcsb import DistributedRCSBValidator
 from boltz.model.validation.rcsb import RCSBValidator
@@ -135,9 +137,20 @@ def _make_test_data(
     atoms_per_tok = n_atom // n_tok
     assert n_atom == n_tok * atoms_per_tok
 
+    # Non-degenerate range so per-token atom counts vary.  The distributed
+    # path goes through pad_and_scatter_atom_features_dtensor which handles
+    # arbitrary (potentially shard-boundary-crossing) counts via per-shard
+    # padding to max_atoms_per_shard, exercising the padded→masked cumsum
+    # remap inside DistributedValidator.
+    min_atoms = max(2, atoms_per_tok - 1)
+    max_atoms = atoms_per_tok
+
     rng = torch.Generator().manual_seed(seed)
 
     selected_keys = [
+        # atom_counts_per_token is needed by pad_and_scatter_atom_features_dtensor
+        # to compute per-shard padding; not consumed by the validator itself.
+        "atom_counts_per_token",
         "atom_pad_mask",
         "atom_to_token",
         "atom_resolved_mask",
@@ -160,7 +173,7 @@ def _make_test_data(
         n_tokens=n_tok,
         n_atoms=n_atom,
         n_msa=1,
-        atom_counts_per_token_range=(atoms_per_tok, atoms_per_tok),
+        atom_counts_per_token_range=(min_atoms, max_atoms),
         device=torch.device("cpu"),
         float_value_range=(-1.0, 1.0),
         selected_keys=selected_keys,
@@ -315,14 +328,11 @@ def _parallel_distributed_test(rank, payload):
     manager = DistributedManager()
     comm = TransposeComm(manager.group["cp"], manager.layout_subgroups["cp"])
 
-    # --- distribute batch/out as DTensors (inlined) ---
-    mesh = manager.device_mesh_subgroups
+    # --- distribute batch/out as DTensors ---
+    mesh = manager.device_mesh_subgroups  # 3D mesh: (dp, cp_axis_0, cp_axis_1)
     device = manager.device
-    cp0_size = mesh.get_group("cp_axis_0").size()
-    cp0_rank = mesh.get_coordinate()[1]
 
     placements_token = _placements["token_features"]
-    placements_atom = _placements["atom_features"]
 
     def _dt(tensor, placements):
         return distribute_tensor(
@@ -331,51 +341,102 @@ def _parallel_distributed_test(rank, payload):
             placements=placements,
         )
 
-    DIAG_SHARDED_KEYS = {"atom_to_token", "token_to_rep_atom", "r_set_to_rep_atom"}
+    # --- atom features go through the production pad_and_scatter helper ---
+    # This mirrors what trainingv2.py does at runtime: each CP shard receives a
+    # contiguous range of tokens and its real atoms, padded out to
+    # max_atoms_per_shard so atom_to_token is block-diagonal under CP sharding
+    # regardless of how variable per-token atom counts cross naïve shard
+    # boundaries.  The validator's padded->masked cumsum remap is then meaningful.
+    cp_mesh = mesh["cp_axis_0", "cp_axis_1"]
+    cp_group = manager.group["cp"]
+    cp_src_global = torch.distributed.get_process_group_ranks(cp_group)[0]
+    is_cp_src = torch.distributed.get_rank(cp_group) == cp_src_global
 
-    batch_dtensor = {}
+    # Atom-side keys the helper handles (intersection with what's actually present).
+    ATOM_KEYS = {
+        "atom_counts_per_token",
+        "atom_pad_mask",
+        "atom_to_token",
+        "atom_resolved_mask",
+        "coords",
+        "ref_element",
+        "token_to_rep_atom",
+        "r_set_to_rep_atom",
+        "frames_idx",
+    } & batch_host.keys()
+    # sample_atom_coords is in `out`, has a multiplicity dim; scatter each
+    # sample separately as a single-repr atom feature and re-stack after.
+    SAC_PREFIX = "sample_atom_coords_"
+    sac_keys = tuple(f"{SAC_PREFIX}{i}" for i in range(n_samples))
+
+    cp_placements_for_helper: dict[str, tuple] = {k: TRAINING_FEATURE_PLACEMENTS_V2[k] for k in ATOM_KEYS}
+    for k in sac_keys:
+        cp_placements_for_helper[k] = TRAINING_FEATURE_PLACEMENTS_V2["atom_resolved_mask"]  # (Shard(0), Replicate())
+
+    if is_cp_src:
+        atom_inputs: dict[str, torch.Tensor] = {}
+        for k in ATOM_KEYS:
+            v = batch_host[k][0].to(device)  # strip batch dim (B=1)
+            if k == "frames_idx" and v.ndim == 2:
+                v = v.unsqueeze(0)  # add ensemble dim: (T, 3) -> (E=1, T, 3)
+            atom_inputs[k] = v
+        for i, k in enumerate(sac_keys):
+            atom_inputs[k] = out_host["sample_atom_coords"][i].to(device)
+    else:
+        atom_inputs = None
+
+    cp_dts = pad_and_scatter_atom_features_dtensor(
+        features=atom_inputs,
+        placements=cp_placements_for_helper,
+        group=cp_group,
+        src_rank_global=cp_src_global,
+        device_mesh=cp_mesh,
+    )
+
+    # Wrap each CP DTensor as a 3D DTensor on the full mesh (adds DP batch dim).
+    # The 3D placement preserves the CP-axis sharding and replicates on DP:
+    # CP placement (Shard(d), Replicate())   -> full placement (Shard(0), Shard(d+1), Replicate())
+    # CP placement (Shard(d), Shard(d2))     -> (Shard(0), Shard(d+1), Shard(d2+1))
+    def _cp_to_full_placement(cp_pl):
+        from torch.distributed.tensor.placement_types import Shard
+
+        def _shift(p):
+            if isinstance(p, Shard):
+                return Shard(p.dim + 1)
+            return p
+
+        return (Shard(0), _shift(cp_pl[0]), _shift(cp_pl[1]))
+
+    def _wrap_full(cp_dt):
+        local = cp_dt.to_local().unsqueeze(0)  # add batch dim
+        full_pl = _cp_to_full_placement(cp_dt.placements)
+        return DTensor.from_local(local, mesh, full_pl)
+
+    batch_dtensor: dict = {}
+    for k in ATOM_KEYS:
+        if k == "atom_counts_per_token":
+            continue  # used by helper internally; validator doesn't consume
+        batch_dtensor[k] = _wrap_full(cp_dts[k])
+
+    # Reassemble sample_atom_coords across multiplicity: each per-sample CP DTensor
+    # has local shape (max_atoms_per_shard, 3); stack on dim 0 to get
+    # (n_samples, max_atoms_per_shard, 3), then wrap as 3D DTensor with
+    # placement (Shard(0), Shard(1), Replicate()) so global shape is
+    # (n_samples, N_atoms_padded, 3).  Shard(0) on DP=1 is a no-op.
+    sac_locals = [cp_dts[k].to_local() for k in sac_keys]
+    sac_local = torch.stack(sac_locals, dim=0)
+    out_dtensor: dict = {
+        "sample_atom_coords": DTensor.from_local(sac_local, mesh, SINGLE_REPR),
+    }
+
+    # --- token + pair features remain via distribute_tensor ---
     for key, val in batch_host.items():
+        if key in batch_dtensor or key == "atom_counts_per_token":
+            continue
+        if key in ATOM_KEYS:
+            continue
         if key == "idx_dataset":
             batch_dtensor[key] = val.to(device)
-            continue
-        if key in DIAG_SHARDED_KEYS:
-            if key == "r_set_to_rep_atom" and cp0_size > 1:
-                # Reorder r_set rows so each shard's row range only contains
-                # elements whose representative atom falls within that shard's
-                # column range.
-                B, nr, nc = val.shape
-                nr_l = nr // cp0_size
-                nc_l = nc // cp0_size
-                valid_mask = val[0].any(dim=-1)
-                atom_indices = val[0].argmax(dim=-1)
-                shard_of_row = atom_indices // nc_l
-                reordered = torch.zeros_like(val)
-                for s in range(cp0_size):
-                    shard_rows = val[:, (shard_of_row == s) & valid_mask]
-                    n = min(shard_rows.shape[1], nr_l)
-                    reordered[:, s * nr_l : s * nr_l + n] = shard_rows[:, :n]
-                val = reordered
-
-            B, nr, nc = val.shape
-            nr_l = nr // cp0_size
-            nc_l = nc // cp0_size
-            local_block = (
-                val[
-                    :,
-                    cp0_rank * nr_l : (cp0_rank + 1) * nr_l,
-                    cp0_rank * nc_l : (cp0_rank + 1) * nc_l,
-                ]
-                .contiguous()
-                .to(device)
-            )
-            batch_dtensor[key] = DTensor.from_local(
-                local_block,
-                device_mesh=mesh,
-                placements=SINGLE_REPR,
-            )
-            continue
-        if key in placements_atom:
-            batch_dtensor[key] = _dt(val, placements_atom[key])
             continue
         if key in placements_token:
             batch_dtensor[key] = _dt(val, placements_token[key])
@@ -390,13 +451,10 @@ def _parallel_distributed_test(rank, payload):
         else:
             batch_dtensor[key] = val
 
-    out_dtensor = {
-        "sample_atom_coords": _dt(out_host["sample_atom_coords"], SINGLE_REPR),
-        "pdistogram": _dt(out_host["pdistogram"], PAIR_REPR),
-    }
-    for key in ("plddt",):
-        if key in out_host:
-            out_dtensor[key] = _dt(out_host[key], SINGLE_REPR)
+    # Non-atom out features
+    out_dtensor["pdistogram"] = _dt(out_host["pdistogram"], PAIR_REPR)
+    if "plddt" in out_host:
+        out_dtensor["plddt"] = _dt(out_host["plddt"], SINGLE_REPR)
     for key in ("pde", "pae"):
         if key in out_host:
             out_dtensor[key] = _dt(out_host[key], PAIR_REPR)
@@ -785,8 +843,19 @@ def _parallel_epoch_end_logged_metric_names_test(rank, payload):
     if rmsd_metrics:
         expected.add("val/rmsd")
     if clash_score_metrics:
-        expected.add("val/clash_atoms_count")
-        expected.add("val/clash_atoms_fraction")
+        for m in (
+            "clash_atoms_count",
+            "clash_atoms_fraction",
+            "clash_atoms_count_intra",
+            "clash_atoms_fraction_intra",
+            "clash_atoms_count_inter",
+            "clash_atoms_fraction_inter",
+            "clash_atoms_count_inter_homo",
+            "clash_atoms_fraction_inter_homo",
+            "clash_atoms_count_inter_hetero",
+            "clash_atoms_fraction_inter_hetero",
+        ):
+            expected.add(f"val/{m}")
 
     if confidence_prediction:
         for m in const.out_single_types:

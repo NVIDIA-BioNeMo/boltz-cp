@@ -206,8 +206,11 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
             file_path = cfg.pretrained
 
         print(f"Loading model from {file_path}")
+        hparams = dict(model_module.hparams)
+        if getattr(model_module, "validate_structure", False) and hasattr(model_module, "validators"):
+            hparams["validators"] = model_module.validators
         model_module = type(model_module).load_from_checkpoint(
-            file_path, map_location="cpu", strict=False, **(model_module.hparams)
+            file_path, map_location="cpu", strict=False, **hparams
         )
 
         if cfg.load_confidence_from_trunk:

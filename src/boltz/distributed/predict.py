@@ -133,6 +133,7 @@ def run_predict(
     auto_pad_tokens_for_sm100f: bool = True,
     cuda_memory_profile: bool = False,
     override: bool = False,
+    max_data_retries: int = 5,
 ) -> None:
     """Run distributed Boltz-2 structure prediction with DTensor context parallelism.
 
@@ -215,6 +216,9 @@ def run_predict(
         snapshot pickle to ``out_dir`` at the end of prediction.
     override : bool
         When True, rerun predictions even if output already exists.
+    max_data_retries : int
+        Maximum number of retry attempts when a data sample fails to load.
+        Set to 0 to raise immediately on the first error.
 
     """
     atoms_per_window_queries, atoms_per_window_keys = atoms_per_window_queries_keys
@@ -312,7 +316,16 @@ def run_predict(
     # --- Data loading ---
     torch.set_grad_enabled(False)
     if seed is not None:
-        seed_everything(seed)
+        # Offset the seed by global rank so each rank's RNG stream diverges. Sharded
+        # per-rank draws (e.g. the diffusion coordinate/eps noise, sharded on the cp0
+        # token/atom axis) then carry *independent* entropy instead of every shard
+        # redrawing the identical tile a shared seed would produce. Replicate-axis
+        # consistency is still enforced by explicit broadcast
+        # (create_and_broadcast_tensor_into_placements), not by a shared seed, so this
+        # offset does not desync replicated draws. Mirrors the training seed scheme
+        # (train.py). This restores single-device RNG *entropy* equivalence (not numeric
+        # equivalence, which a consistent distributed RNG would require and does not exist).
+        seed_everything(seed + dist_manager.group_rank["world"])
 
     out_dir = Path(out_dir).expanduser()
     mol_dir = Path(mol_dir).expanduser()
@@ -402,6 +415,7 @@ def run_predict(
         extra_mols_dir=processed.extra_mols_dir,
         max_msa_seqs=max_msa_seqs,
         msa_pad_to_max_seqs=msa_pad_to_max_seqs,
+        max_data_retries=max_data_retries,
         pair_mask_mode=pair_mask_mode,
         atoms_per_window_queries=atoms_per_window_queries,
         atoms_per_window_keys=atoms_per_window_keys,

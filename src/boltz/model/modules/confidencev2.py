@@ -130,7 +130,7 @@ class ConfidenceModule(nn.Module):
             token_s,
             token_z,
             token_level_confidence=token_level_confidence,
-            **confidence_args,
+            **(confidence_args or {}),
         )
 
     def forward(

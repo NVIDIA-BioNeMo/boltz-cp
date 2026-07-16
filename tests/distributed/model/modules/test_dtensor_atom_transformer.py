@@ -389,7 +389,7 @@ def test_atom_transformer(setup_env, multiplicity: int, serial_module_version: s
     K = 10 * grid_group_sizes["cp"][0]  # windows, divisible by cp size
     W = 32
     H = 128
-    val_init_min_max = (-0.2, 0.2)
+    val_init_min_max = (-0.1, 0.1)
 
     dim = 32
     dim_single_cond = dim

@@ -899,7 +899,7 @@ class _PAELossImpl(torch.autograd.Function):
         atom_offset = N_atom_local * group_rank_0
         if B_local % multiplicity != 0:
             raise ValueError(
-                f"true_atom_coords local batch dim ({B_local}) must be " f"divisible by multiplicity ({multiplicity})"
+                f"true_atom_coords local batch dim ({B_local}) must be divisible by multiplicity ({multiplicity})"
             )
         B_batch = B_local // multiplicity
         if pred_atom_coords_local.shape[0] != true_atom_coords_local.shape[0]:
@@ -1682,16 +1682,20 @@ def _compute_frame_pred_impl(
             num_tokens = int(mask_chain_token.sum().item())
             num_atoms = int(mask_chain_atom.sum().item())
 
+            # torch.unique(asym_id_token[i]) includes asym IDs that only appear
+            # in padding positions; after masking with token_pad_mask those chains
+            # have num_tokens=0.  Skip them before indexing mol_type to avoid
+            # producing an empty tensor whose .item() call raises RuntimeError.
+            if num_tokens == 0 or num_atoms < 3:
+                continue
+
             mol_types = feats["mol_type"][i, mask_chain_token.bool()]
-
-            # sanity check: all chains in the batch must have the same mol_type
-            mol_type_unique = mol_types.unique()
-            assert (
-                mol_type_unique.numel() <= 1
-            ), f"all chains in the batch must have the same mol_type but got {mol_type_unique}"  # sanity check
-
-            # skip frame reassignment if the chain is not a non-polymer or has fewer than 3 atoms
-            if mol_type_unique.item() != const.chain_type_ids["NONPOLYMER"] or num_atoms < 3:
+            mol_type = mol_types[0]
+            assert (mol_types == mol_type).all(), (
+                f"Chain asym_id={id.item()}: mixed mol_types {mol_types.unique().tolist()} — "
+                "all tokens in a chain must share the same mol_type"
+            )
+            if mol_type != const.chain_type_ids["NONPOLYMER"]:
                 continue
 
             # sanity check: num_atoms = num_tokens for non-polymers
@@ -2884,39 +2888,54 @@ class _PDELossImpl(torch.autograd.Function):
                 "These must match due to diagonal block co-sharding semantics."
             )
 
-        # Promote to at least float32 to match serial get_target_pde which uses
-        # .float() inside autocast(enabled=False).
-        coord_dtype = torch.promote_types(pred_coords_local.dtype, torch.float32)
-        pred_coords_local = pred_coords_local.to(dtype=coord_dtype)
-        true_coords_local = true_coords_local.to(dtype=coord_dtype)
-        token_to_rep_local = token_to_rep_local.to(dtype=coord_dtype)
+        # NOTE: @torch.amp.custom_fwd without cast_inputs does NOT disable autocast
+        # inside the body — torch.einsum is on the autocast list and would
+        # downcast its output to bf16 even with fp32 inputs. Wrap the
+        # coord/mask projection in autocast(enabled=False) so the resulting
+        # tensors stay fp32+ all the way to cdist_pde. This mirrors the
+        # serial get_target_pde which does the same projection inside
+        # autocast(enabled=False).
+        # Coords are guaranteed fp32+ by upstream (boltz2.py disables autocast
+        # around the diffusion sampler), but we promote_types defensively here
+        # so the einsums produce a deterministic fp32+ output regardless of the
+        # caller's dtype contract.
+        with torch.amp.autocast("cuda", enabled=False):
+            coord_dtype = torch.promote_types(pred_coords_local.dtype, torch.float32)
+            pred_coords_local = pred_coords_local.to(dtype=coord_dtype)
+            true_coords_local = true_coords_local.to(dtype=coord_dtype)
+            token_to_rep_local = token_to_rep_local.to(dtype=coord_dtype)
 
-        # Get local batch size for einsum reshaping
-        local_B = token_to_rep_local.shape[0]
-        local_N_token = token_to_rep_local.shape[1]
+            # Get local batch size for einsum reshaping
+            local_B = token_to_rep_local.shape[0]
+            local_N_token = token_to_rep_local.shape[1]
 
-        # === Project atom coords to token space using einsum with multiplicity broadcasting ===
-        # Co-sharding assumption: token_to_rep_local operates on local atoms only (diagonal block).
-        pred_coords_reshaped = pred_coords_local.view(local_B, multiplicity, -1, 3)
-        true_coords_reshaped = true_coords_local.view(local_B, multiplicity, -1, 3)
+            # === Project atom coords to token space using einsum with multiplicity broadcasting ===
+            # Co-sharding assumption: token_to_rep_local operates on local atoms only (diagonal block).
+            pred_coords_reshaped = pred_coords_local.view(local_B, multiplicity, -1, 3)
+            true_coords_reshaped = true_coords_local.view(local_B, multiplicity, -1, 3)
 
-        # token_to_rep_local: [local_B, local_N_token, local_N_atom] -> "bta"
-        # coords reshaped: [local_B, mult, local_N_atom, 3] -> "bmac"
-        # Output: [local_B, mult, local_N_token, 3] -> "bmtc"
-        pred_token_coords_row_local = torch.einsum("bta,bmac->bmtc", token_to_rep_local, pred_coords_reshaped).reshape(
-            -1, local_N_token, 3
-        )  # [local_B*mult, local_N_token, 3]
-        true_token_coords_row_local = torch.einsum("bta,bmac->bmtc", token_to_rep_local, true_coords_reshaped).reshape(
-            -1, local_N_token, 3
-        )  # [local_B*mult, local_N_token, 3]
+            # token_to_rep_local: [local_B, local_N_token, local_N_atom] -> "bta"
+            # coords reshaped: [local_B, mult, local_N_atom, 3] -> "bmac"
+            # Output: [local_B, mult, local_N_token, 3] -> "bmtc"
+            # TODO: token_to_rep is a one-hot matrix, refactor to use an index map instead of einsum
+            pred_token_coords_row_local = torch.einsum(
+                "bta,bmac->bmtc", token_to_rep_local, pred_coords_reshaped
+            ).reshape(-1, local_N_token, 3)  # [local_B*mult, local_N_token, 3]
+            true_token_coords_row_local = torch.einsum(
+                "bta,bmac->bmtc", token_to_rep_local, true_coords_reshaped
+            ).reshape(-1, local_N_token, 3)  # [local_B*mult, local_N_token, 3]
 
-        # === Compute factorized mask using einsum with multiplicity broadcasting ===
-        resolved_mask_reshaped = resolved_mask_local.view(local_B, multiplicity, -1).to(
-            dtype=coord_dtype
-        )  # [local_B, mult, local_N_atom]
-        mask_row_local = torch.einsum("bta,bma->bmt", token_to_rep_local, resolved_mask_reshaped).reshape(
-            -1, local_N_token
-        )  # [local_B*mult, local_N_token]
+            # === Compute factorized mask using einsum with multiplicity broadcasting ===
+            # Cast bool resolved_mask to coord dtype so the einsum below runs on
+            # consistent float dtypes with token_to_rep_local. Kept inside the
+            # autocast(disabled) block so mask_row_local stays fp32+ to match
+            # serial parity (serial computes the mask inside autocast(enabled=False)).
+            resolved_mask_reshaped = resolved_mask_local.view(local_B, multiplicity, -1).to(
+                dtype=coord_dtype
+            )  # [local_B, mult, local_N_atom]
+            mask_row_local = torch.einsum("bta,bma->bmt", token_to_rep_local, resolved_mask_reshaped).reshape(
+                -1, local_N_token
+            )  # [local_B*mult, local_N_token]
 
         # === Get global shapes for DTensor metadata ===
         B_mult_global = pred_pde.shape[0]
@@ -3304,7 +3323,7 @@ def confidence_loss(
             "The atom-level confidence path is not implemented for DTensor."
         )
     if mask_loss is not None:
-        raise NotImplementedError("confidence_loss does not yet support mask_loss. " "Pass mask_loss=None (default).")
+        raise NotImplementedError("confidence_loss does not yet support mask_loss. Pass mask_loss=None (default).")
     if relative_supervision_weight != 0.0:
         raise NotImplementedError(
             "confidence_loss does not yet support relative_supervision_weight != 0.0. "

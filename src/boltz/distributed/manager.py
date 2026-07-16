@@ -21,7 +21,6 @@
 
 
 import os
-from copy import deepcopy
 from math import prod
 from typing import Any, Dict, Optional, OrderedDict, Union
 from warnings import warn
@@ -667,7 +666,7 @@ class DistributedManager:
                 # create the subgroup layout for each parent group
                 # TODO: support LayoutMap.reshape to simplify this
                 axes_subgroup = group2subgroup_axes[name_group]
-                slices = deepcopy(coords)
+                slices = list(coords)
                 for axis in axes_subgroup:
                     slices[axis] = slice(None)
                 layout_subgroup = layout[*slices]

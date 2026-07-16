@@ -377,7 +377,8 @@ class BoltzCropper(Cropper):
                     # We switch to the res_idx instead of the token_idx to always
                     # include all tokens from modified residues or from ligands.
                     min_idx = max_idx = center_token["res_idx"]
-                    while new_tokens.size < neighborhood_size_to_use:
+                    target_size = min(neighborhood_size_to_use, max_token_set.size)
+                    while new_tokens.size < target_size:
                         min_idx = min_idx - 1
                         max_idx = max_idx + 1
                         new_tokens = max_token_set

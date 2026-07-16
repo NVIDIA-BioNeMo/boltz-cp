@@ -616,6 +616,11 @@ class Boltz2(LightningModule):
                 if self.predict_bfactor:
                     dict_out["pbfactor"] = self.bfactor_module(s)
 
+            # Flatten (B, 1, A, 3) → (B, A, 3) so coords_flat is always defined before
+            # the confidence module call below. The structure_prediction_training branch
+            # below overrides this with the (possibly multiplicity-expanded) coords.
+            coords_flat = shardwise_flatten_sharded(feats["coords"], start_dim=0, end_dim=1)
+
             # Training: diffusion forward pass
             if self.training and self.structure_prediction_training:
                 atom_coords = feats["coords"]
@@ -623,25 +628,22 @@ class Boltz2(LightningModule):
                 assert K in (multiplicity_diffusion_train, 1)
 
                 # Expand K → multiplicity if needed, then flatten (B, K, L, 3) → (B*K, L, 3).
+                # Pass a shadow feats dict with the reshaped coords so feats["coords"] stays 4D
+                # (B, 1, A, 3) throughout — get_true_coordinates needs the original shape.
                 if K < multiplicity_diffusion_train:
                     atom_coords = shardwise_repeat_interleave(atom_coords, multiplicity_diffusion_train // K, dim=1)
-                feats["coords"] = shardwise_flatten_sharded(atom_coords, start_dim=0, end_dim=1)
+                coords_flat = shardwise_flatten_sharded(atom_coords, start_dim=0, end_dim=1)
 
                 with torch.autocast("cuda", enabled=False):
                     compute_dtype = torch.promote_types(s.dtype, torch.float32)
                     struct_out = self.structure_module(
                         s_trunk=s.to(compute_dtype),
                         s_inputs=s_inputs.to(compute_dtype),
-                        feats=feats,
+                        feats={**feats, "coords": coords_flat},
                         multiplicity=multiplicity_diffusion_train,
                         diffusion_conditioning=diffusion_conditioning_dict,  # noqa: F821
                     )
                     dict_out.update(struct_out)
-
-            elif self.training:
-                # squeeze(1) removes the singleton ensemble dim:
-                # (B, 1, A, 3) → (B*1, A, 3) = (B, A, 3)
-                feats["coords"] = shardwise_flatten_sharded(feats["coords"], start_dim=0, end_dim=1)
 
         if self.confidence_prediction:
             if "frames_idx" in feats and feats["frames_idx"].ndim == 4:
@@ -658,7 +660,7 @@ class Boltz2(LightningModule):
                     x_pred=(
                         dict_out["sample_atom_coords"].detach()
                         if not self.skip_run_structure
-                        else shardwise_repeat_interleave(feats["coords"], diffusion_samples, dim=0)
+                        else shardwise_repeat_interleave(coords_flat, diffusion_samples, dim=0)
                     ),
                     feats=feats,
                     pred_distogram_logits=dict_out["pdistogram"].detach(),
@@ -732,37 +734,51 @@ class Boltz2(LightningModule):
 
         confidence_loss_dict = self._compute_confidence_loss(out, batch)
 
-        # Aggregate losses
-        loss = elementwise_op(
-            elementwise_op(
+        # Aggregate losses.
+        # Confidence-only training: skip the zero-valued structure terms entirely.
+        # Note: elementwise_op wraps ops in autograd.Function.apply(), so requires_grad
+        # is correctly propagated even when one operand has requires_grad=False — backward
+        # still flows through.  The else branch is a performance/clarity improvement:
+        # it avoids 6 unnecessary autograd.Function calls and DTensor.from_local()
+        # constructions for zero-valued terms that contribute nothing to the gradient.
+        if self.structure_prediction_training:
+            loss = elementwise_op(
                 elementwise_op(
-                    scalar_tensor_op(
-                        self.training_args.diffusion_loss_weight,
-                        diffusion_loss_dict["loss"],
-                        ElementwiseOp.PROD,
+                    elementwise_op(
+                        scalar_tensor_op(
+                            self.training_args.diffusion_loss_weight,
+                            diffusion_loss_dict["loss"],
+                            ElementwiseOp.PROD,
+                        ),
+                        scalar_tensor_op(
+                            self.training_args.distogram_loss_weight,
+                            disto_loss,
+                            ElementwiseOp.PROD,
+                        ),
+                        ElementwiseOp.SUM,
                     ),
                     scalar_tensor_op(
-                        self.training_args.distogram_loss_weight,
-                        disto_loss,
+                        # Default 0.0 matches serial boltz2.py (added after other weights).
+                        self.training_args.get("bfactor_loss_weight", 0.0),
+                        bfactor_loss_val,
                         ElementwiseOp.PROD,
                     ),
                     ElementwiseOp.SUM,
                 ),
                 scalar_tensor_op(
-                    # Default 0.0 matches serial boltz2.py (added after other weights).
-                    self.training_args.get("bfactor_loss_weight", 0.0),
-                    bfactor_loss_val,
+                    self.training_args.confidence_loss_weight,
+                    confidence_loss_dict["loss"],
                     ElementwiseOp.PROD,
                 ),
                 ElementwiseOp.SUM,
-            ),
-            scalar_tensor_op(
+            )
+        else:
+            # Confidence-only: only the confidence loss contributes.
+            loss = scalar_tensor_op(
                 self.training_args.confidence_loss_weight,
                 confidence_loss_dict["loss"],
                 ElementwiseOp.PROD,
-            ),
-            ElementwiseOp.SUM,
-        )
+            )
 
         if not (self.global_step % self.log_loss_every_steps):
             self.log("train/distogram_loss", disto_loss.to_local())
@@ -805,6 +821,11 @@ class Boltz2(LightningModule):
 
         true_coords = return_dict["true_coords"]
         true_coords_resolved_mask = return_dict["true_coords_resolved_mask"]
+
+        # get_true_coordinates inserts an ensemble dim (dim 1) for the
+        # validation indexing path; confidence_loss expects 3D (B*mult, N, 3).
+        if true_coords.ndim == 4:
+            true_coords = shardwise_squeeze(true_coords, dim=1)
 
         return confidence_loss(
             out,

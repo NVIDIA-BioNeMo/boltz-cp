@@ -1,3 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# fmt: off
 import torch
 
 from boltz.data import const
@@ -112,7 +134,7 @@ def compute_pb_geometry_metrics(
             .squeeze(-1)
             .long()
         )
-        is_ligand_mask = (
+        _is_ligand_mask = (  # noqa: F841
             torch.bmm(
                 feats["atom_to_token"].float(), feats["mol_type"].unsqueeze(-1).float()
             )
@@ -135,7 +157,7 @@ def compute_pb_geometry_metrics(
         multiplicity, dtype=torch.float32, device=pred_atom_coords.device
     )
 
-    for index_batch in range(len(feats["ligand_edge_index"])):
+    for index_batch in range(len(feats.get("ligand_edge_index", []))):
         if feats["ligand_edge_index"][index_batch].shape[1] == 0:
             continue
         dists = torch.linalg.norm(
@@ -275,7 +297,7 @@ def compute_torsion_angles(coords, torsion_index):
     n_ijk = torch.cross(r_ij, r_kj, dim=-1)
     n_jkl = torch.cross(r_kj, r_kl, dim=-1)
 
-    r_kj_norm = torch.linalg.norm(r_kj, dim=-1)
+    _r_kj_norm = torch.linalg.norm(r_kj, dim=-1)  # noqa: F841
     n_ijk_norm = torch.linalg.norm(n_ijk, dim=-1)
     n_jkl_norm = torch.linalg.norm(n_jkl, dim=-1)
 
@@ -308,7 +330,7 @@ def compute_stereo_metrics(pred_atom_coords, feats):
         multiplicity, dtype=torch.float32, device=pred_atom_coords.device
     )
 
-    for index_batch in range(len(feats["ligand_edge_index"])):
+    for index_batch in range(len(feats.get("ligand_edge_index", []))):
         if feats["ligand_chiral_atom_index"][index_batch].shape[1] > 0:
             pred_chiral_torsion_angles = compute_torsion_angles(
                 pred_atom_coords,
@@ -378,7 +400,7 @@ def compute_pb_flatness_metrics(pred_atom_coords, feats, buffer=0.25):
         multiplicity, dtype=torch.float32, device=pred_atom_coords.device
     )
 
-    for index_batch in range(len(feats["ligand_aromatic_5_ring_index"])):
+    for index_batch in range(len(feats.get("ligand_aromatic_5_ring_index", []))):
         ring_5_index = feats["ligand_aromatic_5_ring_index"][index_batch].T
         ring_6_index = feats["ligand_aromatic_6_ring_index"][index_batch].T
         double_bond_index = feats["ligand_planar_double_bond_index"][index_batch].T

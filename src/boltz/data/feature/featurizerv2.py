@@ -21,7 +21,9 @@
 
 
 # fmt: off
+# isort: skip_file
 import math
+import warnings
 from collections import deque
 from typing import Optional
 
@@ -1451,6 +1453,12 @@ def process_atom_features(
         atom_idx += len(token_atoms)
 
     disto_coords_ensemble = np.array(disto_coords_ensemble)  # (N_TOK, N_ENS, 3)
+    if disto_coords_ensemble.ndim != 3:
+        msg = (
+            f"disto_coords_ensemble has shape {disto_coords_ensemble.shape} "
+            f"(expected 3D: N_TOK x N_ENS x 3) for record {data.record.id}"
+        )
+        raise ValueError(msg)
 
     # Compute ensemble distogram
     L = len(data.tokens)
@@ -1555,8 +1563,11 @@ def process_atom_features(
     if isinstance(override_coords, Tensor):
         coords = override_coords.unsqueeze(0)
 
-    # Apply random roto-translation to the input conformers
-    for i in range(torch.max(ref_space_uid)):
+    # Apply random roto-translation to the input conformers.
+    # +1 because ref_space_uid values are 0-based and range() is exclusive.
+    # Without it, the last residue group is skipped, and single-residue
+    # molecules (max uid = 0) get no augmentation at all.
+    for i in range(int(torch.max(ref_space_uid).item()) + 1):
         included = ref_space_uid == i
         if torch.sum(included) > 0 and torch.any(resolved_mask[included]):
             ref_pos[included] = center_random_augmentation(
@@ -1564,10 +1575,17 @@ def process_atom_features(
             )[0]
 
     # Compute padding and apply
-    if max_atoms is not None:
+    if max_atoms is not None and max_atoms >= len(atom_data):
         assert max_atoms % atoms_per_window_queries == 0
         pad_len = max_atoms - len(atom_data)
     else:
+        if max_atoms is not None:
+            warnings.warn(
+                f"Sample has {len(atom_data)} atoms which exceeds "
+                f"max_atoms={max_atoms}; falling back to "
+                f"atoms_per_window_queries={atoms_per_window_queries} alignment.",
+                stacklevel=2,
+            )
         pad_len = (
             (len(atom_data) - 1) // atoms_per_window_queries + 1
         ) * atoms_per_window_queries - len(atom_data)
