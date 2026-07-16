@@ -1,3 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
+# ruff: noqa
+# fmt: off
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Set, List, Union
 
@@ -10,6 +34,15 @@ from boltz.model.potentials.schedules import (
     PiecewiseStepFunction,
 )
 from boltz.model.loss.diffusionv2 import weighted_rigid_align
+
+_HAS_TRITON_VDW = False
+if torch.cuda.is_available():
+    try:
+        from boltz.model.potentials.triton.vdw_overlap import vdw_overlap_energy, vdw_overlap_gradient
+
+        _HAS_TRITON_VDW = True
+    except ImportError:
+        pass
 
 
 class Potential(ABC):
@@ -136,7 +169,7 @@ class Potential(ABC):
             compute_gradient=True,
         )
         energy, dEnergy = self.compute_function(
-            value, 
+            value,
             *args, negation_mask=negation_mask, compute_derivative=True
         )
         if union_index is not None:
@@ -261,6 +294,10 @@ class FlatBottomPotential(Potential):
 
         neg_overflow_mask = value < lower_bounds
         pos_overflow_mask = value > upper_bounds
+
+        # Promote k to value dtype so index-put ops don't fail on mixed dtypes
+        # (e.g. float32 k into float64 energy/dEnergy).
+        k = k.to(value.dtype)
 
         energy = torch.zeros_like(value)
         energy[neg_overflow_mask] = (k * (lower_bounds - value))[neg_overflow_mask]
@@ -435,7 +472,8 @@ class ConnectionsPotential(FlatBottomPotential, DistancePotential):
 
 
 class VDWOverlapPotential(FlatBottomPotential, DistancePotential):
-    def compute_args(self, feats, parameters):
+    def _extract_vdw_features(self, feats, parameters):
+        """Extract per-atom VDW features without building O(N^2) pair indices."""
         atom_chain_id = (
             torch.bmm(
                 feats["atom_to_token"].float(), feats["asym_id"].unsqueeze(-1).float()
@@ -444,7 +482,8 @@ class VDWOverlapPotential(FlatBottomPotential, DistancePotential):
             .long()
         )[0]
         atom_pad_mask = feats["atom_pad_mask"][0].bool()
-        chain_sizes = torch.bincount(atom_chain_id[atom_pad_mask])
+        num_chains = atom_chain_id.max() + 1 if atom_chain_id.numel() > 0 else 0
+        chain_sizes = torch.bincount(atom_chain_id[atom_pad_mask], minlength=num_chains)
         single_ion_mask = (chain_sizes > 1)[atom_chain_id]
 
         vdw_radii = torch.zeros(
@@ -457,16 +496,6 @@ class VDWOverlapPotential(FlatBottomPotential, DistancePotential):
             feats["ref_element"].float() @ vdw_radii.unsqueeze(-1)
         ).squeeze(-1)[0]
 
-        pair_index = torch.triu_indices(
-            atom_chain_id.shape[0],
-            atom_chain_id.shape[0],
-            1,
-            device=atom_chain_id.device,
-        )
-
-        pair_pad_mask = atom_pad_mask[pair_index].all(dim=0)
-        pair_ion_mask = single_ion_mask[pair_index[0]] * single_ion_mask[pair_index[1]]
-
         num_chains = atom_chain_id.max() + 1
         connected_chain_index = feats["connected_chain_index"][0]
         connected_chain_matrix = torch.eye(
@@ -478,6 +507,67 @@ class VDWOverlapPotential(FlatBottomPotential, DistancePotential):
         connected_chain_matrix[connected_chain_index[1], connected_chain_index[0]] = (
             True
         )
+
+        return (
+            atom_vdw_radii,
+            atom_pad_mask,
+            single_ion_mask,
+            atom_chain_id,
+            connected_chain_matrix,
+            parameters["buffer"],
+        )
+
+    def compute(self, coords, feats, parameters):
+        """Compute VDW overlap energy, using Triton kernel on CUDA.
+
+        On CUDA with Triton available, bypasses the O(N^2) pair-index
+        construction in ``compute_args`` and calls the Triton kernel directly
+        for O(N^2) time with O(N) memory.  Falls back to the base-class
+        PyTorch path on CPU.
+
+        Note: the Triton kernel shares features (masks, radii, chain IDs)
+        across all batch elements.  Features are extracted from batch_idx=0;
+        callers must ensure feats are identical across the batch dimension.
+        """
+        if _HAS_TRITON_VDW and coords.device.type == "cuda":
+            vdw_feats = self._extract_vdw_features(feats, parameters)
+            return vdw_overlap_energy(coords, *vdw_feats)
+        return super().compute(coords, feats, parameters)
+
+    def compute_gradient(self, coords, feats, parameters):
+        """Compute VDW overlap gradient, using Triton kernel on CUDA.
+
+        On CUDA with Triton available, bypasses the O(N^2) pair-index
+        construction and calls the Triton gradient kernel directly.
+        Falls back to the base-class PyTorch path on CPU.
+
+        Note: features are shared across batch elements (see ``compute``).
+        """
+        if _HAS_TRITON_VDW and coords.device.type == "cuda":
+            vdw_feats = self._extract_vdw_features(feats, parameters)
+            return vdw_overlap_gradient(coords, *vdw_feats)
+        return super().compute_gradient(coords, feats, parameters)
+
+    def compute_args(self, feats, parameters):
+        (
+            atom_vdw_radii,
+            atom_pad_mask,
+            single_ion_mask,
+            atom_chain_id,
+            connected_chain_matrix,
+            _buffer,
+        ) = self._extract_vdw_features(feats, parameters)
+
+        pair_index = torch.triu_indices(
+            atom_chain_id.shape[0],
+            atom_chain_id.shape[0],
+            1,
+            device=atom_chain_id.device,
+        )
+
+        pair_pad_mask = atom_pad_mask[pair_index].all(dim=0)
+        pair_ion_mask = single_ion_mask[pair_index[0]] * single_ion_mask[pair_index[1]]
+
         connected_chain_mask = connected_chain_matrix[
             atom_chain_id[pair_index[0]], atom_chain_id[pair_index[1]]
         ]

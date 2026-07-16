@@ -76,7 +76,7 @@ class PredictionDatasetCPWithDTensorV2(torch.utils.data.Dataset):
         extra_mols_dir: Optional[Path] = None,
         max_msa_seqs: int = const.max_msa_seqs,
         msa_pad_to_max_seqs: bool = False,
-        raise_exception: bool = True,
+        max_data_retries: int = 5,
         pair_mask_mode: PairMaskMode = PairMaskMode.NONE,
         atoms_per_window_queries: Optional[int] = 32,
         atoms_per_window_keys: Optional[int] = 128,
@@ -103,7 +103,7 @@ class PredictionDatasetCPWithDTensorV2(torch.utils.data.Dataset):
         self.tokenizer = Boltz2Tokenizer()
         self.featurizer = Boltz2Featurizer()
         self.canonicals = load_canonicals(self.mol_dir)
-        self.raise_exception = raise_exception
+        self.max_data_retries = max_data_retries
         self.num_ensembles = num_ensembles
         self.per_shard_token_multiple = per_shard_token_multiple
 
@@ -132,16 +132,25 @@ class PredictionDatasetCPWithDTensorV2(torch.utils.data.Dataset):
                 self.msa_pad_to_max_seqs = True
 
         self.FEATURE_TO_DTENSOR_PLACEMENT = INFERENCE_FEATURE_PLACEMENTS_V2
+        self._fallback_depth = 0
 
     @property
     def use_window_batching(self) -> bool:
         return self.pair_mask_mode == PairMaskMode.NONE
 
     def _raise_or_return_item_0(self, e: Exception) -> None:
-        if self.raise_exception:
+        if self.max_data_retries <= 0:
             raise e
-        else:
-            return self.__getitem__(0)
+        if self._fallback_depth >= self.max_data_retries:
+            raise RuntimeError(
+                f"Data loading failed {self.max_data_retries} consecutive times. " f"Last error: {e}"
+            ) from e
+        self._fallback_depth += 1
+        try:
+            fallback_idx = np.random.randint(0, len(self))
+            return self.__getitem__(fallback_idx)
+        finally:
+            self._fallback_depth -= 1
 
     def __getitem__(self, idx: int) -> Dict[str, DTensor]:
         if self.is_cp_rank_zero:
@@ -336,7 +345,7 @@ class Boltz2InferenceDataModuleDTensor(pl.LightningDataModule):
         extra_mols_dir: Optional[Path] = None,
         max_msa_seqs: int = const.max_msa_seqs,
         msa_pad_to_max_seqs: bool = False,
-        raise_exception: bool = True,
+        max_data_retries: int = 5,
         pair_mask_mode: PairMaskMode = PairMaskMode.NONE,
         atoms_per_window_queries: int = 32,
         atoms_per_window_keys: int = 128,
@@ -361,7 +370,7 @@ class Boltz2InferenceDataModuleDTensor(pl.LightningDataModule):
         self.msa_pad_to_max_seqs = msa_pad_to_max_seqs
         self.device_mesh = device_mesh
         self.device_mesh_cpu = device_mesh_cpu
-        self.raise_exception = raise_exception
+        self.max_data_retries = max_data_retries
         self.pair_mask_mode = pair_mask_mode
         self.atoms_per_window_queries = atoms_per_window_queries
         self.atoms_per_window_keys = atoms_per_window_keys
@@ -386,7 +395,7 @@ class Boltz2InferenceDataModuleDTensor(pl.LightningDataModule):
             extra_mols_dir=self.extra_mols_dir,
             max_msa_seqs=self.max_msa_seqs,
             msa_pad_to_max_seqs=self.msa_pad_to_max_seqs,
-            raise_exception=self.raise_exception,
+            max_data_retries=self.max_data_retries,
             pair_mask_mode=self.pair_mask_mode,
             num_ensembles=self.num_ensembles,
             per_shard_token_multiple=self.per_shard_token_multiple,

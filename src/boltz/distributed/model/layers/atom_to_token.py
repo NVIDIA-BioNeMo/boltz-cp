@@ -67,12 +67,6 @@
 # device mesh is needed.
 ########################################################################################
 
-########################################################################################
-# TODO:
-# 1. add sanity check here to assert no uneven sharding in the input DTensor in _reconstruct_onehot_diag_block_global
-# 2. adopt test tests/distributed/model/layers/test_dtensor_atom_to_token.py from dev branch
-# 3. add onehot check in _reconstruct_onehot_diag_block_global
-########################################################################################
 
 import torch
 from torch import Tensor
@@ -552,7 +546,12 @@ def _reconstruct_onehot_diag_block_global(
     if dtensor.placements != expected_placements:
         raise ValueError(f"Expected placements {expected_placements}, got {dtensor.placements}")
 
-    # TODO: add sanity check here to assert no uneven sharding in the input DTensor
+    for i_dim_mesh, placement in enumerate(expected_placements):
+        if isinstance(placement, Shard) and dtensor.shape[placement.dim] % device_mesh.shape[i_dim_mesh] != 0:
+            raise ValueError(
+                f"Uneven sharding tensor dimension {placement.dim} of size {dtensor.shape[placement.dim]} "
+                f"along device mesh dimension {i_dim_mesh} of size {device_mesh.shape[i_dim_mesh]} is not supported"
+            )
 
     local = dtensor.to_local()
     B = local.shape[0]
@@ -581,11 +580,12 @@ def _reconstruct_onehot_diag_block_global(
     end_dim2 = start_dim2 + n_per_shard_dim2
 
     if cp_axis_1_rank == 0:
-        # TODO add check to make sure the local tensor is one-hot
-        # n_non_zeros = local.sum(axis=2)
-        # is_onehot = (n_non_zeros == 1).all()
-        # if not is_onehot:
-        #     raise ValueError("Input DTensor shard is not one-hot for CP rank {(cp_axis_0_rank, cp_axis_1_rank)}")
+        n_non_zeros = local.sum(dim=2)
+        if not ((n_non_zeros == 0) | (n_non_zeros == 1)).all():
+            raise ValueError(
+                f"Input DTensor shard is not one-hot for CP rank ({cp_axis_0_rank}, {cp_axis_1_rank}): "
+                f"found rows with sum not in {{0, 1}}"
+            )
         result[:, start_dim1:end_dim1, start_dim2:end_dim2] = local
 
     torch.distributed.all_reduce(result, op=torch.distributed.ReduceOp.SUM, group=device_mesh.get_group("cp_axis_0"))

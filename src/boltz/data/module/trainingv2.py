@@ -122,6 +122,7 @@ class DataConfigV2:
     val_skip_sample_threshold_tokens: Optional[int] = None
     val_skip_sample_threshold_atoms: Optional[int] = None
     val_skip_sample_threshold_seqs: Optional[int] = None
+    max_data_retries: int = 5
 
 
 @dataclass
@@ -392,6 +393,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         msa_sampling: bool = False,
         compute_frames: bool = False,
         bfactor_md_correction: bool = False,
+        max_data_retries: int = 5,
     ) -> None:
         """Initialize the training dataset.
 
@@ -444,10 +446,27 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.overfit = overfit
         self.compute_frames = compute_frames
         self.bfactor_md_correction = bfactor_md_correction
+        self.max_data_retries = max_data_retries
+        self._fallback_depth = 0
 
         self.samples: list[pd.DataFrame] = []
         for d in datasets:
             self.samples.append(d.samples[:overfit] if overfit else d.samples)
+
+    def _raise_or_return_item_0(self, e: Exception) -> dict[str, Tensor]:
+        if self.max_data_retries <= 0:
+            raise e
+        if self._fallback_depth >= self.max_data_retries:
+            raise RuntimeError(
+                f"Data loading failed {self.max_data_retries} consecutive times. "
+                f"Last error: {e}"
+            ) from e
+        self._fallback_depth += 1
+        try:
+            fallback_idx = np.random.randint(0, len(self))
+            return self.__getitem__(fallback_idx)
+        finally:
+            self._fallback_depth -= 1
 
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
         """Get an item from the dataset.
@@ -496,15 +515,15 @@ class TrainingDataset(torch.utils.data.Dataset):
         try:
             structure = load_structure(record, dataset.struct_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(idx)
+            print(f"Failed to load input for {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Tokenize structure
         try:
             tokenized = dataset.tokenizer.tokenize(structure)
         except Exception as e:  # noqa: BLE001
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(idx)
+            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Compute crop
         try:
@@ -521,8 +540,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                     msg = "No tokens in cropped structure."
                     raise ValueError(msg)  # noqa: TRY301
         except Exception as e:  # noqa: BLE001
-            print(f"Cropper failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(idx)
+            print(f"Cropper failed on {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Get unique chain ids
         chain_ids = set(tokenized.tokens["asym_id"])
@@ -535,8 +554,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                 msa_dir=dataset.msa_dir,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"MSA loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"MSA loading failed for {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Load templates
         templates = FileNotFoundError
@@ -552,7 +571,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                     random=random,
                 )
             except Exception as e:  # noqa: BLE001
-                print(
+                print(  # noqa: T201
                     f"Template loading failed for {record.id} with error {e}. Using no templates."
                 )
                 templates = None
@@ -573,8 +592,8 @@ class TrainingDataset(torch.utils.data.Dataset):
             mol_names = mol_names - set(molecules.keys())
             molecules.update(load_molecules(self.moldir, mol_names))
         except Exception as e:  # noqa: BLE001
-            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Finalize input data
         input_data = InputTraining(
@@ -621,11 +640,11 @@ class TrainingDataset(torch.utils.data.Dataset):
                 bfactor_md_correction=self.bfactor_md_correction,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
+            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
             import traceback
 
             traceback.print_exc()
-            return self.__getitem__(idx)
+            return self._raise_or_return_item_0(e)
 
         features["pdb_id"] = record.id
         return features
@@ -675,6 +694,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         no_template_prob: float = 0.0,
         compute_frames: bool = False,
         bfactor_md_correction: bool = False,
+        max_data_retries: int = 5,
     ) -> None:
         """Initialize the training dataset.
 
@@ -720,6 +740,23 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.no_template_prob = no_template_prob
         self.compute_frames = compute_frames
         self.bfactor_md_correction = bfactor_md_correction
+        self.max_data_retries = max_data_retries
+        self._fallback_depth = 0
+
+    def _raise_or_return_item_0(self, e: Exception) -> dict[str, torch.Tensor]:
+        if self.max_data_retries <= 0:
+            raise e
+        if self._fallback_depth >= self.max_data_retries:
+            raise RuntimeError(
+                f"Data loading failed {self.max_data_retries} consecutive times. "
+                f"Last error: {e}"
+            ) from e
+        self._fallback_depth += 1
+        try:
+            fallback_idx = np.random.randint(0, len(self))
+            return self.__getitem__(fallback_idx)
+        finally:
+            self._fallback_depth -= 1
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Get an item from the dataset.
@@ -750,15 +787,15 @@ class ValidationDataset(torch.utils.data.Dataset):
         try:
             structure = load_structure(record, dataset.struct_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Failed to load input for {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Tokenize structure
         try:
             tokenized = dataset.tokenizer.tokenize(structure)
         except Exception as e:  # noqa: BLE001
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Get unique chains
         chain_ids = set(np.unique(tokenized.tokens["asym_id"]).tolist())
@@ -767,8 +804,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         try:
             msas = load_msas(chain_ids, record, dataset.msa_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"MSA loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"MSA loading failed for {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Load templates
         if self.use_templates and dataset.template_dir is not None:
@@ -783,7 +820,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                     random=random,
                 )
             except Exception as e:  # noqa: BLE001
-                print(
+                print(  # noqa: T201
                     f"Template loading failed for {record.id} with error {e}. Using no templates."
                 )
                 templates = None
@@ -802,8 +839,8 @@ class ValidationDataset(torch.utils.data.Dataset):
             mol_names = mol_names - set(molecules.keys())
             molecules.update(load_molecules(self.moldir, mol_names))
         except Exception as e:  # noqa: BLE001
-            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Finalize input data
         input_data = InputTraining(
@@ -851,8 +888,8 @@ class ValidationDataset(torch.utils.data.Dataset):
             )
 
         except Exception as e:  # noqa: BLE001
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
+            return self._raise_or_return_item_0(e)
 
         # Add dataset idx
         idx_dataset = torch.tensor([idx_dataset], dtype=torch.long)
@@ -1075,6 +1112,7 @@ class Boltz2TrainingDataModule(pl.LightningDataModule):
             no_template_prob=cfg.no_template_prob_train,
             compute_frames=cfg.compute_frames,
             bfactor_md_correction=cfg.bfactor_md_correction,
+            max_data_retries=cfg.max_data_retries,
         )
         self._val_set = ValidationDataset(
             datasets=train if cfg.overfit is not None else val,
@@ -1105,6 +1143,7 @@ class Boltz2TrainingDataModule(pl.LightningDataModule):
             no_template_prob=cfg.no_template_prob_val,
             compute_frames=cfg.compute_frames,
             bfactor_md_correction=cfg.bfactor_md_correction,
+            max_data_retries=cfg.max_data_retries,
         )
 
     def setup(self, stage: Optional[str] = None) -> None:  # noqa: ARG002 (unused)

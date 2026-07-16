@@ -536,23 +536,33 @@ class AtomDiffusion(Module):
 
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
-            random_R, random_tr = compute_random_augmentation(
-                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
-            )
-            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
-            atom_coords = (
-                torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
-            )
+            # Mask-weighted centering — excludes padded atoms (coord ≈ 0).
+            atom_mean = (atom_coords * atom_mask[:, :, None]).sum(
+                dim=1, keepdim=True
+            ) / atom_mask[:, :, None].sum(dim=1, keepdim=True)
+            atom_coords = atom_coords - atom_mean
             if atom_coords_denoised is not None:
-                atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
-                atom_coords_denoised = (
-                    torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
-                    + random_tr
+                atom_coords_denoised = atom_coords_denoised - atom_mean
+
+            if self.coordinate_augmentation:
+                random_R, random_tr = compute_random_augmentation(
+                    multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
                 )
+                atom_coords = (
+                    torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
+                )
+                if atom_coords_denoised is not None:
+                    atom_coords_denoised = (
+                        torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
+                        + random_tr
+                    )
+            else:
+                random_R = None
             if (
                 steering_args is not None
                 and steering_args["physical_guidance_update"]
                 and scaled_guidance_update is not None
+                and random_R is not None
             ):
                 scaled_guidance_update = torch.einsum(
                     "bmd,bds->bms", scaled_guidance_update, random_R

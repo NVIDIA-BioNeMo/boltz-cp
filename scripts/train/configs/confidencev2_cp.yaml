@@ -1,0 +1,25 @@
+defaults:
+  - confidencev2
+  - structurev2_cp
+  - _self_
+
+# DTensor context-parallel confidence fine-tuning config.
+#
+# Inherits both ``confidencev2`` (confidence head, confidence training_args,
+# binder-pocket probs) and ``structurev2_cp`` (CP topology, precision,
+# attention backends, single-device trainer setup, RCSBValidator,
+# num_workers=0, dataset placeholders).  Only entries that are specific to
+# confidence + CP go below — everything else is intentionally omitted to
+# avoid duplication.
+
+trainer:
+  # ``structurev2_cp`` already sets ``accumulate_grad_batches: 1``.  Repeating
+  # the value explicitly because ``confidencev2`` sets 128 and we depend on
+  # the override surviving the merge.  The rationale is confidence-specific:
+  # confidence loss functions use the subgraph trick (``DTensor.from_local``
+  # with ``.detach()``), leaving ``_local_tensor.requires_grad=False``.
+  # Lightning's gradient accumulation divides the loss via native DTensor
+  # dispatch, which builds a new DTensor from the detached ``_local_tensor``
+  # and can drop ``requires_grad=True``.  ``accumulate_grad_batches=1``
+  # avoids that native division entirely.
+  accumulate_grad_batches: 1

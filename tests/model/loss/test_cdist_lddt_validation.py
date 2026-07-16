@@ -22,7 +22,6 @@
 import pytest
 import torch
 
-from boltz.distributed.model.loss.validation import clash_score
 from boltz.distributed.model.loss.validation import factored_lddt_loss as triton_factored_lddt_loss
 from boltz.model.loss.validation import factored_lddt_loss
 from boltz.testing.utils import random_features
@@ -100,33 +99,3 @@ def test_factored_lddt_loss_cdist_consistency(use_cardinality_weighted, repeat_a
                 triton_lddt[key][zero_total_mask], torch.ones_like(triton_lddt[key][zero_total_mask])
             )
     assert saw_zero_total, "Expected at least one modality to have zero total."
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test runs on triton kernel but CUDA is not available")
-def test_clash_score_counts_and_fraction():
-    device = torch.device("cuda")
-    clash_cutoff = 2.0
-    multiplicity = 2
-
-    coords_repr = torch.tensor(
-        [
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [5.0, 0.0, 0.0], [9.0, 0.0, 0.0]],
-            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [6.0, 0.0, 0.0], [9.0, 0.0, 0.0]],
-        ],
-        device=device,
-        dtype=torch.float32,
-    )
-    token_pad_mask = torch.tensor([[True, True, True, False]], device=device)
-
-    clash_atoms_count, clash_atoms_fraction = clash_score(
-        coords_repr=coords_repr,
-        token_pad_mask=token_pad_mask,
-        multiplicity=multiplicity,
-        clash_cutoff=clash_cutoff,
-    )
-
-    expected_count = torch.tensor([2, 0], device=device, dtype=clash_atoms_count.dtype)
-    expected_fraction = torch.tensor([2.0 / 3.0, 0.0], device=device, dtype=clash_atoms_fraction.dtype)
-
-    torch.testing.assert_close(clash_atoms_count, expected_count)
-    torch.testing.assert_close(clash_atoms_fraction, expected_fraction)

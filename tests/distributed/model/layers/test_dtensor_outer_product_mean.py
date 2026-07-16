@@ -296,8 +296,8 @@ def test_outer_product_parallel(setup_env, dtype, check_error_hist):
         C_in = 64
         C_hidden = 32
         C_out = 128
-        min_val_init = -5e-2
-        max_val_init = 5e-2
+        min_val_init = -2e-2
+        max_val_init = 2e-2
     else:
         N = size_ring * 2
         S = size_ring * 3

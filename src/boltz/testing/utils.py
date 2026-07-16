@@ -19,6 +19,8 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+# fmt: off
+
 import json
 import math
 import multiprocessing
@@ -186,6 +188,16 @@ def compute_pairwise_lddt_rmsd_matrices(
 
     Each element is a coordinate tensor of shape ``(n_atoms, 3)``.
 
+    All N*M pairs are evaluated in a single batched pass on GPU (CUDA when
+    available, else CPU) instead of an N*M Python loop of per-pair calls.  Both
+    ``weighted_rigid_align`` and :func:`get_weighted_lddt` operate over a leading
+    batch dimension, so the whole pair grid is aligned and scored with a handful
+    of kernel launches.  The batch is chunked so the O(n_atoms^2) lDDT distance
+    matrices stay within a few GB regardless of structure size.  This is ~1-2
+    orders of magnitude faster than the loop for the n=20 inference ensembles the
+    predict tests compare (the loop's 3*N*M ~ 1200 serial alignments per sample
+    were the dominant cost of the n=20 structural comparison).
+
     Returns
     -------
     lddt_matrix : np.ndarray, shape (N, M)
@@ -194,16 +206,38 @@ def compute_pairwise_lddt_rmsd_matrices(
     from boltz.model.loss.diffusion import weighted_rigid_align
 
     n, m = len(coords_a), len(coords_b)
-    lddt_mat = np.zeros((n, m))
-    rmsd_mat = np.zeros((n, m))
-    for i in range(n):
-        for j in range(m):
-            a = coords_a[i].unsqueeze(0)
-            b = coords_b[j].unsqueeze(0)
-            w = torch.ones_like(a[..., 0])
-            b_aligned = weighted_rigid_align(true_coords=b, pred_coords=a, weights=w, mask=w)
-            lddt_mat[i, j] = get_weighted_lddt(a, b_aligned, w).mean().item()
-            rmsd_mat[i, j] = torch.sum((a - b_aligned) ** 2, dim=-1).sqrt().mean().item()
+    if n == 0 or m == 0:
+        return np.zeros((n, m)), np.zeros((n, m))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # (N, L, 3) / (M, L, 3); float32 matches the original path (SVD needs >= fp32).
+    a_struct = torch.stack(list(coords_a)).to(device=device, dtype=torch.float32)
+    b_struct = torch.stack(list(coords_b)).to(device=device, dtype=torch.float32)
+    n_atoms = a_struct.shape[1]
+
+    # Flattened pair grid: pair k = (i, j) with i = k // m, j = k % m.  coords_a is the
+    # "pred" frame and coords_b the "true" coords -- matching the original per-pair
+    # weighted_rigid_align(true_coords=b, pred_coords=a) -> b aligned onto a.
+    n_pairs = n * m
+    pair_i = torch.arange(n_pairs, device=device) // m
+    pair_j = torch.arange(n_pairs, device=device) % m
+
+    lddt_flat = torch.empty(n_pairs, device=device, dtype=torch.float32)
+    rmsd_flat = torch.empty(n_pairs, device=device, dtype=torch.float32)
+
+    # Bound the (chunk, n_atoms, n_atoms) lDDT distance matrices to ~a few GB.
+    chunk = max(1, int(1.5e8 / (n_atoms * n_atoms)))
+    for start in range(0, n_pairs, chunk):
+        end = min(start + chunk, n_pairs)
+        a = a_struct[pair_i[start:end]]  # (c, L, 3) -- pred frame
+        b = b_struct[pair_j[start:end]]  # (c, L, 3) -- true coords
+        w = torch.ones(a.shape[:2], device=device, dtype=a.dtype)  # (c, L)
+        b_aligned = weighted_rigid_align(true_coords=b, pred_coords=a, weights=w, mask=w)
+        lddt_flat[start:end] = get_weighted_lddt(a, b_aligned, w).mean(dim=-1)
+        rmsd_flat[start:end] = torch.sum((a - b_aligned) ** 2, dim=-1).sqrt().mean(dim=-1)
+
+    lddt_mat = lddt_flat.reshape(n, m).cpu().numpy()
+    rmsd_mat = rmsd_flat.reshape(n, m).cpu().numpy()
     return lddt_mat, rmsd_mat
 
 
@@ -2447,6 +2481,30 @@ def random_features(
         asym_id[:, 1:] = mol_changes.to(torch.int64).cumsum(dim=1)
     features["asym_id"] = asym_id
 
+    # Generate random inter-chain connections (connected_chain_index).
+    # Uses the first batch element's asym_id (identical across batch).
+    # Randomly select k out of n_pairs indices and reverse-map to (src, dst).
+    unique_chains = torch.unique(asym_id[0])
+    num_chains = unique_chains.numel()
+    if num_chains >= 2:
+        n_pairs = num_chains * (num_chains - 1) // 2
+        k = max(1, int(0.2 * n_pairs))
+        selected = torch.randperm(n_pairs, device=device, generator=rng)[:k]
+        # Reverse map: flat index p -> (row, col) in strict upper triangle.
+        # Pairs are ordered (0,1),(0,2),...,(0,n-1),(1,2),...,(n-2,n-1).
+        # Row r owns (n-1-r) pairs; cumulative pairs before row r = r*(2n-r-1)/2.
+        # Inverting r*(2n-r-1)/2 = p for r gives the closed-form floor formula.
+        p = selected.double()
+        n = num_chains
+        row = (n - 2 - torch.floor(torch.sqrt(-8 * p + 4 * n * (n - 1) - 7) / 2.0 - 0.5)).long()
+        col = (selected - row * (2 * n - row - 1) // 2 + row + 1).long()
+        src_edges = unique_chains[row.to(device)]
+        dst_edges = unique_chains[col.to(device)]
+        connected_chain_index = torch.stack([src_edges, dst_edges], dim=0)
+    else:
+        connected_chain_index = torch.empty((2, 0), dtype=torch.long, device=device)
+    features["connected_chain_index"] = connected_chain_index.unsqueeze(0).expand(size_batch, -1, -1)
+
     # Fuse consecutive asym_id values into shared sym_id buckets per batch.
     # E.g. asym_id unique [0,1,2,3,4] -> sym_id [0,0,1,1,2]
     sym_id = torch.empty_like(asym_id)
@@ -2852,13 +2910,10 @@ def pad_to_length(t: DTensor, dim: int, length: int) -> DTensor:
 
     if t.shape[dim] % mesh_size != 0:
         raise ValueError(
-            f"t.shape[{dim}]={t.shape[dim]} is not divisible by "
-            f"mesh size {mesh_size} along the axis sharding dim {dim}"
+            f"t.shape[{dim}]={t.shape[dim]} is not divisible by mesh size {mesh_size} along the axis sharding dim {dim}"
         )
     if length % mesh_size != 0:
-        raise ValueError(
-            f"length={length} is not divisible by " f"mesh size {mesh_size} along the axis sharding dim {dim}"
-        )
+        raise ValueError(f"length={length} is not divisible by mesh size {mesh_size} along the axis sharding dim {dim}")
 
     local = t.to_local()
     local_target = length // mesh_size
@@ -3581,3 +3636,151 @@ class RecomputeProfiler:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+
+
+# ---------------------------------------------------------------------------
+# CCD ligand feature loading for PB metric tests
+# ---------------------------------------------------------------------------
+
+LIGAND_KEYS = (
+    "ligand_edge_index",
+    "ligand_edge_lower_bounds",
+    "ligand_edge_upper_bounds",
+    "ligand_edge_bond_mask",
+    "ligand_edge_angle_mask",
+    "ligand_chiral_atom_index",
+    "ligand_chiral_check_mask",
+    "ligand_chiral_atom_orientations",
+    "ligand_stereo_bond_index",
+    "ligand_stereo_check_mask",
+    "ligand_stereo_bond_orientations",
+    "ligand_aromatic_5_ring_index",
+    "ligand_aromatic_6_ring_index",
+    "ligand_planar_double_bond_index",
+)
+
+
+def load_ligand_features_from_ccd(
+    mols_dir: str,
+    mol_name: str = "PHE",
+    atom_offset: int = 0,
+) -> tuple[torch.Tensor, dict]:
+    """Load ligand geometry features from a CCD pickle file.
+
+    Uses ``load_molecules`` + ``get_symmetries`` from ``boltz.data.mol``
+    to read the pre-computed PB feature arrays (edge index, distance
+    bounds, chirality, stereo, aromatics) stored inside the RDKit Mol.
+
+    Parameters
+    ----------
+    mols_dir : str
+        Path to the directory containing per-residue ``.pkl`` files
+        (e.g. ``tests/test_data/data/mols``).
+    mol_name : str
+        CCD component name (default ``"PHE"``).
+    atom_offset : int
+        Offset added to all atom-index features so they refer to the
+        correct position within the full-structure atom array.
+
+    Returns
+    -------
+    coords : torch.Tensor
+        Ideal 3-D coordinates, shape ``(n_atoms, 3)``, ``float32``.
+    features : dict[str, torch.Tensor]
+        Dictionary keyed by the strings in ``LIGAND_KEYS``.
+    """
+    from boltz.data.mol import get_symmetries, load_molecules
+
+    mols = load_molecules(mols_dir, [mol_name])
+    mol = mols[mol_name]
+    syms = get_symmetries(mols)
+    (
+        _syms_ccd, _names_ccd,
+        edge_index, lower_bounds, upper_bounds, bond_mask, angle_mask,
+        chiral_atom_index, chiral_check_mask, chiral_atom_orientations,
+        stereo_bond_index, stereo_check_mask, stereo_bond_orientations,
+        aromatic_5_ring_index, aromatic_6_ring_index, planar_double_bond_index,
+    ) = syms[mol_name]
+
+    conf = mol.GetConformer(0)
+    coords = torch.tensor(
+        [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z]
+         for i in range(mol.GetNumAtoms())],
+        dtype=torch.float32,
+    )
+
+    features = {
+        "ligand_edge_index": torch.tensor(edge_index, dtype=torch.long) + atom_offset,
+        "ligand_edge_lower_bounds": torch.tensor(lower_bounds, dtype=torch.float32),
+        "ligand_edge_upper_bounds": torch.tensor(upper_bounds, dtype=torch.float32),
+        "ligand_edge_bond_mask": torch.tensor(bond_mask),
+        "ligand_edge_angle_mask": torch.tensor(angle_mask),
+        "ligand_chiral_atom_index": torch.tensor(chiral_atom_index, dtype=torch.long) + atom_offset,
+        "ligand_chiral_check_mask": torch.tensor(chiral_check_mask),
+        "ligand_chiral_atom_orientations": torch.tensor(chiral_atom_orientations),
+        "ligand_stereo_bond_index": torch.tensor(stereo_bond_index, dtype=torch.long) + atom_offset,
+        "ligand_stereo_check_mask": torch.tensor(stereo_check_mask),
+        "ligand_stereo_bond_orientations": torch.tensor(stereo_bond_orientations),
+        "ligand_aromatic_5_ring_index": torch.tensor(aromatic_5_ring_index, dtype=torch.long) + atom_offset,
+        "ligand_aromatic_6_ring_index": torch.tensor(aromatic_6_ring_index, dtype=torch.long) + atom_offset,
+        "ligand_planar_double_bond_index": torch.tensor(planar_double_bond_index, dtype=torch.long) + atom_offset,
+    }
+    return coords, features
+
+
+def make_pb_test_data(n_tok, n_atom, mols_dir, mol_name="PHE", batch_size=1, n_samples=2, seed=42):
+    """Create test data with a real CCD ligand for PB metric tests.
+
+    Loads the ligand from the CCD pickle file at ``mols_dir/mol_name.pkl``
+    via :func:`load_ligand_features_from_ccd`.
+
+    Layout per batch element (``atoms_per_tok = n_atom // n_tok``):
+        Tokens  0 .. n_tok-4 : PROTEIN (asym_id=0)
+        Tokens  n_tok-3 .. n_tok-1 : NONPOLYMER / ligand (asym_id=1)
+
+    The 3 ligand tokens x ``atoms_per_tok`` atoms must be >= the number
+    of heavy atoms in the CCD component.  CCD ideal coordinates are
+    placed at the ligand atom positions in ``sample_atom_coords``;
+    remaining protein positions are filled with random noise.
+    """
+    atoms_per_tok = n_atom // n_tok
+    rng = torch.Generator().manual_seed(seed)
+
+    feats = random_features(
+        size_batch=batch_size,
+        n_tokens=n_tok,
+        n_atoms=n_atom,
+        n_msa=1,
+        atom_counts_per_token_range=(atoms_per_tok, atoms_per_tok),
+        device=torch.device("cpu"),
+        float_value_range=(-1.0, 1.0),
+        selected_keys=["atom_to_token", "mol_type", "atom_pad_mask", "atom_counts_per_token", "asym_id"],
+        rng=rng,
+    )
+
+    batch: dict = {}
+    for k, v in feats.items():
+        batch[k] = v.to(torch.float32) if v.is_floating_point() else v
+    batch["atom_to_token"] = batch["atom_to_token"].to(torch.float32)
+
+    lig_start_tok = n_tok - 3
+    batch["mol_type"][:, :lig_start_tok] = const.chain_type_ids["PROTEIN"]
+    batch["mol_type"][:, lig_start_tok:] = const.chain_type_ids["NONPOLYMER"]
+
+    batch["asym_id"][:, :lig_start_tok] = 0
+    batch["asym_id"][:, lig_start_tok:] = 1
+
+    lig_atom_start = lig_start_tok * atoms_per_tok
+
+    lig_coords, lig_feats = load_ligand_features_from_ccd(mols_dir, mol_name, atom_offset=lig_atom_start)
+    n_lig_atoms = lig_coords.shape[0]
+
+    sample_coords = torch.randn(batch_size * n_samples, n_atom, 3, generator=rng)
+    for s in range(batch_size * n_samples):
+        sample_coords[s, lig_atom_start : lig_atom_start + n_lig_atoms] = lig_coords
+
+    for k in LIGAND_KEYS:
+        batch[k] = [lig_feats[k].clone() for _ in range(batch_size)]
+
+    out = {"sample_atom_coords": sample_coords}
+    return batch, out

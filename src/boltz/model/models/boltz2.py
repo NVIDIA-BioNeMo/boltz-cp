@@ -584,22 +584,25 @@ class Boltz2(LightningModule):
                 atom_coords = atom_coords.repeat_interleave(
                     multiplicity_diffusion_train // K, 0
                 )
-                feats["coords"] = atom_coords  # (multiplicity, L, 3)
-                assert len(feats["coords"].shape) == 3
+                if self.confidence_prediction:
+                    # Confidence+structure hybrid: shadow preserves 4D batch["coords"]
+                    # for get_true_coordinates downstream.
+                    feats_shadow = {**feats, "coords": atom_coords}
+                else:
+                    # Structure-only: mutate in-place so compute_loss sees 3D coords.
+                    feats["coords"] = atom_coords
+                    feats_shadow = feats
+                assert len(feats_shadow["coords"].shape) == 3
 
                 with torch.autocast("cuda", enabled=False):
                     struct_out = self.structure_module(
                         s_trunk=s.to(compute_dtype),
                         s_inputs=s_inputs.to(compute_dtype),
-                        feats=feats,
+                        feats=feats_shadow,
                         multiplicity=multiplicity_diffusion_train,
                         diffusion_conditioning=diffusion_conditioning,
                     )
                     dict_out.update(struct_out)
-
-            elif self.training:
-                feats["coords"] = feats["coords"].squeeze(1)
-                assert len(feats["coords"].shape) == 3
 
         if self.confidence_prediction:
             dict_out.update(

@@ -1,0 +1,30 @@
+{
+  "name": "fold-cp",
+  "version": "0.24.2",
+  "description": "Integrate DTensor-based context parallelism (CP) into a custom co-folding / structure-prediction model — sharding the O(N²) pair and attention tensors across a multi-GPU device mesh via explicit ring/transpose collectives. A top-level cpize_model_workflow conductor prioritizes, sequences, and gates the whole effort end-to-end, delegating each phase to focused skills. Explores the user's model and data pipeline, builds and probes distributed test infrastructure (local GPUs or SLURM), implements DTensor data-feature sharding and CP model modules mapped to a located CP reference implementation (e.g. Boltz-CP, via $BOLTZ_CP_REPO), writes serial-as-ground-truth multi-rank parity tests, dispatches the work across an orchestrated coder+reviewer team, and benchmarks max-token / walltime. Ships a SessionStart hook that injects the CP hard-rules and an opt-in PreToolUse guard protecting serial ground-truth files and distributed-test timeouts.",
+  "interface": {
+    "displayName": "Fold CP"
+  },
+  "keywords": [
+    "context-parallelism",
+    "context parallelism",
+    "cp",
+    "dtensor",
+    "boltz",
+    "alphafold3",
+    "co-folding",
+    "structure-prediction",
+    "pairformer",
+    "diffusion",
+    "sharding",
+    "multi-gpu",
+    "distributed",
+    "parity-test",
+    "serial-ground-truth",
+    "benchmark",
+    "profiling",
+    "nsys"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json"
+}

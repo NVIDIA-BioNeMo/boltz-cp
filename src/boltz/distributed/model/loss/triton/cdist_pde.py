@@ -624,19 +624,19 @@ class _CdistPDEImpl(torch.autograd.Function):
         # (gradient flow is broken by .long() in bin_index computation)
         if true_coords_row.requires_grad:
             raise ValueError(
-                "true_coords_row should not require gradients " "(gradient flow is broken by bin_index computation)"
+                "true_coords_row should not require gradients (gradient flow is broken by bin_index computation)"
             )
         if true_coords_col.requires_grad:
             raise ValueError(
-                "true_coords_col should not require gradients " "(gradient flow is broken by bin_index computation)"
+                "true_coords_col should not require gradients (gradient flow is broken by bin_index computation)"
             )
         if pred_coords_row.requires_grad:
             raise ValueError(
-                "pred_coords_row should not require gradients " "(gradient flow is broken by bin_index computation)"
+                "pred_coords_row should not require gradients (gradient flow is broken by bin_index computation)"
             )
         if pred_coords_col.requires_grad:
             raise ValueError(
-                "pred_coords_col should not require gradients " "(gradient flow is broken by bin_index computation)"
+                "pred_coords_col should not require gradients (gradient flow is broken by bin_index computation)"
             )
         if mask_row.requires_grad:
             raise ValueError("mask_row should not require gradients")
@@ -650,19 +650,19 @@ class _CdistPDEImpl(torch.autograd.Function):
         # Validate coordinate shapes
         if true_coords_row.shape != (B_mul, N_row, 3):
             raise ValueError(
-                f"true_coords_row shape mismatch: got {true_coords_row.shape}, " f"expected ({B_mul}, {N_row}, 3)"
+                f"true_coords_row shape mismatch: got {true_coords_row.shape}, expected ({B_mul}, {N_row}, 3)"
             )
         if true_coords_col.shape != (B_mul, N_col, 3):
             raise ValueError(
-                f"true_coords_col shape mismatch: got {true_coords_col.shape}, " f"expected ({B_mul}, {N_col}, 3)"
+                f"true_coords_col shape mismatch: got {true_coords_col.shape}, expected ({B_mul}, {N_col}, 3)"
             )
         if pred_coords_row.shape != (B_mul, N_row, 3):
             raise ValueError(
-                f"pred_coords_row shape mismatch: got {pred_coords_row.shape}, " f"expected ({B_mul}, {N_row}, 3)"
+                f"pred_coords_row shape mismatch: got {pred_coords_row.shape}, expected ({B_mul}, {N_row}, 3)"
             )
         if pred_coords_col.shape != (B_mul, N_col, 3):
             raise ValueError(
-                f"pred_coords_col shape mismatch: got {pred_coords_col.shape}, " f"expected ({B_mul}, {N_col}, 3)"
+                f"pred_coords_col shape mismatch: got {pred_coords_col.shape}, expected ({B_mul}, {N_col}, 3)"
             )
 
         # Check mask dimensions
@@ -671,17 +671,13 @@ class _CdistPDEImpl(torch.autograd.Function):
 
         # Validate mask_row shape
         if mask_row.shape[0] not in (B, B_mul):
-            raise ValueError(
-                f"mask_row batch dimension must be B ({B}) or B_mul ({B_mul}), " f"got {mask_row.shape[0]}"
-            )
+            raise ValueError(f"mask_row batch dimension must be B ({B}) or B_mul ({B_mul}), got {mask_row.shape[0]}")
         if mask_row.shape[1] != N_row:
             raise ValueError(f"mask_row N dimension mismatch: got {mask_row.shape[1]}, expected {N_row}")
 
         # Validate mask_col shape
         if mask_col.shape[0] not in (B, B_mul):
-            raise ValueError(
-                f"mask_col batch dimension must be B ({B}) or B_mul ({B_mul}), " f"got {mask_col.shape[0]}"
-            )
+            raise ValueError(f"mask_col batch dimension must be B ({B}) or B_mul ({B_mul}), got {mask_col.shape[0]}")
         if mask_col.shape[1] != N_col:
             raise ValueError(f"mask_col N dimension mismatch: got {mask_col.shape[1]}, expected {N_col}")
 
@@ -689,9 +685,19 @@ class _CdistPDEImpl(torch.autograd.Function):
         # This makes grad_out_mask_denom be None in backward() instead of zeros
         ctx.set_materialize_grads(False)
 
+        # Triton math ops (tl.sqrt, tl.log, tl.exp) require fp32+.
+        # pred_pde may be bf16 under autocast (it is a logit tensor from the
+        # confidence module); coordinate inputs are already promoted to at
+        # least float32 at the call site (confidencev2.py) but we cast
+        # defensively here in case the calling convention changes.
+        compute_dtype = torch.promote_types(pred_pde.dtype, torch.float32)
+        true_coords_row = true_coords_row.to(compute_dtype)
+        true_coords_col = true_coords_col.to(compute_dtype)
+        pred_coords_row = pred_coords_row.to(compute_dtype)
+        pred_coords_col = pred_coords_col.to(compute_dtype)
+
         # Output buffers - scalar per batch [B_mul]
-        # Use float64 if input is float64, otherwise float32
-        output_dtype = pred_pde.dtype if pred_pde.dtype == torch.float64 else torch.float32
+        output_dtype = compute_dtype
         out_loss_num = torch.zeros(B_mul, device=device, dtype=output_dtype)
         out_mask_denom = torch.zeros(B_mul, device=device, dtype=output_dtype)
 
@@ -842,11 +848,15 @@ class _CdistPDEImpl(torch.autograd.Function):
 
         # Validate grad_out_loss_num shape (scalar per batch)
         if grad_out_loss_num.shape != (B_mul,):
-            raise ValueError(
-                f"grad_out_loss_num shape mismatch: got {grad_out_loss_num.shape}, " f"expected ({B_mul},)"
-            )
+            raise ValueError(f"grad_out_loss_num shape mismatch: got {grad_out_loss_num.shape}, expected ({B_mul},)")
 
-        # Output gradient buffer
+        # The Triton kernel computes in fp32+ (tl.exp / tl.sqrt require fp32+).
+        # Upcast pred_pde and allocate the gradient buffer in the same compute
+        # dtype so that block_ptr element types match for both load and store.
+        # Save original dtype so the gradient can be cast back before returning.
+        pde_input_dtype = pred_pde.dtype
+        grad_compute_dtype = torch.promote_types(pde_input_dtype, torch.float32)
+        pred_pde = pred_pde.to(grad_compute_dtype)
         grad_pred_pde = torch.zeros_like(pred_pde)
 
         # Block sizes (tuned for N=4096, num_bins=64)
@@ -941,6 +951,10 @@ class _CdistPDEImpl(torch.autograd.Function):
             num_warps=4,
             num_stages=2,
         )
+
+        # Cast gradient back to the original pred_pde dtype for autograd.
+        if grad_pred_pde.dtype != pde_input_dtype:
+            grad_pred_pde = grad_pred_pde.to(pde_input_dtype)
 
         # Return gradients (None for non-differentiable inputs)
         return grad_pred_pde, None, None, None, None, None, None, None, None, None

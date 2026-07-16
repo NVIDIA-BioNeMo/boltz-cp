@@ -1,5 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# fmt: off
+# isort: skip_file
+
 import math
 import random
+import warnings
 from typing import Optional
 from collections import deque
 import numba
@@ -842,10 +867,17 @@ def process_atom_features(
     )[0]
 
     # Compute padding and apply
-    if max_atoms is not None:
+    if max_atoms is not None and max_atoms >= len(atom_data):
         assert max_atoms % atoms_per_window_queries == 0
         pad_len = max_atoms - len(atom_data)
     else:
+        if max_atoms is not None:
+            warnings.warn(
+                f"Sample has {len(atom_data)} atoms which exceeds "
+                f"max_atoms={max_atoms}; falling back to "
+                f"atoms_per_window_queries={atoms_per_window_queries} alignment.",
+                stacklevel=2,
+            )
         pad_len = (
             (len(atom_data) - 1) // atoms_per_window_queries + 1
         ) * atoms_per_window_queries - len(atom_data)

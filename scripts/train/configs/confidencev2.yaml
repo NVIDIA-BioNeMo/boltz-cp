@@ -1,0 +1,71 @@
+defaults:
+  - structurev2
+  - _self_
+
+# Boltz2 confidence fine-tuning: inherits structurev2 (trainingv2 data + Boltz2 trunk).
+# Overrides mirror confidence.yaml for checkpoints, training mode, confidence head, and diffusion.
+
+output: # PATH_HERE
+pretrained: # PATH_TO_STRUCTURE_CHECKPOINT_FILE
+load_confidence_from_trunk: false
+
+data:
+  compute_frames: true
+  return_train_symmetries: true
+  # Match confidence.yaml (v1): confidence fine-tuning uses 0.3 binder-pocket
+  # conditioning probability (vs 0.15 for structure training in structurev2.yaml).
+  train_binder_pocket_conditioned_prop: 0.3
+  val_binder_pocket_conditioned_prop: 0.3
+
+trainer:
+  accumulate_grad_batches: 128
+
+model:
+  structure_prediction_training: false
+  confidence_prediction: true
+  alpha_pae: 1
+
+  confidence_model_args:
+    num_dist_bins: 64
+    max_dist: 22
+    add_s_to_z_prod: true
+    add_s_input_to_s: true
+    add_z_input_to_z: true
+    pairformer_args:
+      num_blocks: 8
+      num_heads: 16
+      dropout: 0.25
+      activation_checkpointing: true
+    confidence_args:
+      num_plddt_bins: 50
+      num_pde_bins: 64
+      num_pae_bins: 64
+      use_separate_heads: true
+      relative_confidence: null
+
+  training_args:
+    sampling_steps: 200
+    diffusion_multiplicity: 16
+    confidence_loss_weight: 3e-3
+    max_lr: 0.0018
+    symmetry_correction: true
+    run_confidence_sequentially: false
+    # NOTE: weight_decay (0.003) and weight_decay_exclude (true) are inherited
+    # from structurev2.yaml. v1 confidence.yaml used no weight decay. With
+    # structure_prediction_training=false the trunk is frozen, so decay applies
+    # only to confidence-head weights — keeping the structurev2 values until
+    # we have empirical evidence one way or the other.
+
+  validation_args:
+    run_confidence_sequentially: true
+
+  diffusion_process_args:
+    synchronize_sigmas: true
+
+  steering_args:
+    fk_steering: false
+    num_particles: 3
+    fk_lambda: 4.0
+    fk_resampling_interval: 3
+    physical_guidance_update: false
+    num_gd_steps: 16

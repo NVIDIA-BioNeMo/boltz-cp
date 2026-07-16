@@ -53,6 +53,7 @@ from omegaconf import OmegaConf
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 import boltz.distributed.model.modules.diffusion as dist_diffusion_module
+import boltz.distributed.model.modules.utils as dist_utils_module
 import boltz.distributed.train as train_module
 import boltz.model.loss.diffusionv2 as serial_loss_v2_module
 import boltz.model.modules.diffusionv2 as serial_diffusion_v2_module
@@ -68,8 +69,10 @@ from boltz.distributed.model.modules.diffusion import AtomDiffusion as DistAtomD
 from boltz.distributed.model.modules.utils import SDPAWithBiasBackend, TriAttnBackend
 from boltz.distributed.predict import run_predict
 from boltz.distributed.testing.utils import setup_mock_training_datamodule_config
+from boltz.distributed.utils import create_distributed_randn as _real_create_distributed_randn
 from boltz.model.models.boltz2 import Boltz2 as SerialBoltz2
 from boltz.model.modules.diffusionv2 import AtomDiffusion as SerialAtomDiffusionV2
+from boltz.model.modules.utils import random_rotations
 from boltz.model.validation.rcsb import RCSBValidator
 from boltz.testing.utils import (
     SetModuleInfValues,
@@ -142,6 +145,7 @@ class TrainTestConfig:
     seed: int = 42
 
     v2: bool = False
+    compute_frames: bool = False
     strict_loading: bool = True
     wandb: dict[str, Any] | None | _Unset = _UNSET
     save_top_k: int = -1
@@ -188,6 +192,7 @@ def _write_train_config(cfg: TrainTestConfig) -> None:
     data_dict["pad_to_max_seqs"] = True
     data_dict["msa_sampling_training"] = False
     data_dict["moldir"] = str(cfg.mol_dir)
+    data_dict["compute_frames"] = cfg.compute_frames
 
     if cfg.overfit is not None:
         data_dict["overfit"] = cfg.overfit
@@ -300,7 +305,9 @@ def _write_train_config(cfg: TrainTestConfig) -> None:
         config["trainer"]["limit_val_batches"] = cfg.limit_val_batches
 
     if cfg.mode == "serial":
-        config["trainer"]["precision"] = 32 if cfg.precision == "FP32" else cfg.precision
+        # Map our precision strings to Lightning Trainer's expected values.
+        _serial_precision_map = {"FP32": 32, "FP64": 64}
+        config["trainer"]["precision"] = _serial_precision_map.get(cfg.precision, cfg.precision)
         config["v2"] = cfg.v2
         config["disable_checkpoint"] = cfg.disable_checkpoint
         config["save_top_k"] = cfg.save_top_k
@@ -411,62 +418,7 @@ def _worker_validation_parity(
 
     monkeypatch.setattr(DistAtomDiffusionV2, "noise_distribution", _dist_noise_dist)
 
-    # Deterministic noise via distribute_atom_features (intersperse padding)
-    _noise_dt_cache: list[DTensor | None] = [None]
-    _noise_computed = [False]
-
-    def _compute_noise_dt_once(device_mesh, dtype):
-        if _noise_computed[0]:
-            return
-        _noise_computed[0] = True
-        manager = DistributedManager()
-        _io_keys = {"noise"}
-        _placements = get_feature_placements(
-            atom_keys=set(),
-            model_io_keys=_io_keys,
-            model_io_fp32_keys=set(),
-        )
-        size_batch = atom_counts_per_token_host.shape[0]
-        multiplicity_val = noise_global_host.shape[0] // size_batch
-        noise_unflat = noise_global_host.unflatten(0, (size_batch, multiplicity_val))
-        inputs_io = {"atom_counts_per_token": atom_counts_per_token_host.clone()}
-        for i_mul in range(multiplicity_val):
-            inputs_io[f"noise_{i_mul}"] = noise_unflat[:, i_mul].to(dtype=dtype)
-        placements_cp_model_io_mul = {
-            f"{k}_{i_mul}": v for k, v in _placements["cp_model_io"].items() for i_mul in range(multiplicity_val)
-        }
-        placements_cp = _placements["cp_atom_features"] | placements_cp_model_io_mul
-        placements_model_io_mul = {
-            f"{k}_{i_mul}": v for k, v in _placements["model_io"].items() for i_mul in range(multiplicity_val)
-        }
-        placements_dp_cp = placements_model_io_mul
-        io_feats = distribute_atom_features(
-            inputs=inputs_io,
-            placements_cp=placements_cp,
-            placements_dp_cp=placements_dp_cp,
-            device_mesh=manager.device_mesh_subgroups,
-            cp_group=manager.group["cp"],
-            multiplicities={"noise": multiplicity_val},
-        )
-        _noise_dt_cache[0] = io_feats.pop("noise").to(dtype=dtype)
-
-    _dist_in_val = [False]
-
-    def _det_create_randn(shape, device_mesh, placements, dtype=torch.float32, scale=1.0):
-        if _dist_in_val[0]:
-            from boltz.distributed.utils import create_distributed_randn as _real_create_randn
-
-            return _real_create_randn(shape, device_mesh, placements, dtype=dtype, scale=0.0)
-        from boltz.testing.utils import pad_to_length as _pad
-
-        _compute_noise_dt_once(device_mesh, dtype)
-        n = _noise_dt_cache[0]
-        if n.dtype != dtype:
-            n = n.to(dtype=dtype)
-        if len(shape) > 1 and n.shape[1] < shape[1]:
-            n = _pad(n, dim=1, length=shape[1])
-        return n * scale
-
+    _dist_in_val, _det_create_randn = _make_det_noise_setup(noise_global_host, atom_counts_per_token_host)
     monkeypatch.setattr(dist_diffusion_module, "create_distributed_randn", _det_create_randn)
 
     _orig_dist_val_step = Boltz2Distributed.validation_step
@@ -512,7 +464,7 @@ def _worker_validation_parity(
     # Token-level metrics (disto_lddt_*, disto_loss): default tolerance.
     # Trailing underscore omitted so the global weighted-average "val/lddt"
     # (not just "val/lddt_*") also gets the relaxed tolerance.
-    _forward_dependent_prefixes = ("val/lddt", "val/complex_lddt")
+    _forward_dependent_prefixes = ("val/lddt", "val/complex_lddt", "val/clash", "val/pb", "val/rmsd")
     _lddt_keys_compared = []
     if serial_metrics:
         for k in serial_metrics:
@@ -525,13 +477,13 @@ def _worker_validation_parity(
                         exp,
                         atol=2e-4,
                         rtol=0.005,
-                        msg=lambda m: f"Rank {rank}: metric '{k}' mismatch: {m}",
+                        msg=lambda m, _k=k: f"Rank {rank}: metric '{_k}' mismatch: {m}",
                     )
                 else:
                     torch.testing.assert_close(
                         got,
                         exp,
-                        msg=lambda m: f"Rank {rank}: metric '{k}' mismatch: {m}",
+                        msg=lambda m, _k=k: f"Rank {rank}: metric '{_k}' mismatch: {m}",
                     )
                 if "lddt" in k:
                     _lddt_keys_compared.append(k)
@@ -615,7 +567,7 @@ def test_boltz2_validation_parity(
     model_dict = _e2e_model_dict(multiplicity=multiplicity, validate_structure=True)
     model_dict.pop("_target_")
     model_dict.pop("validators", None)
-    _val_validators = [RCSBValidator(val_names=["RCSB"], confidence_prediction=False)]
+    _val_validators = [RCSBValidator(val_names=["RCSB"], confidence_prediction=False, physicalism_metrics=True)]
     pretrained_model = SerialBoltz2(**model_dict, validators=_val_validators)
     init_module_params_glorot(pretrained_model, gain=scale_glorot)
     pretrained_model.apply(SetModuleInfValues())
@@ -722,7 +674,9 @@ def test_boltz2_validation_parity(
     @functools.wraps(_orig_serial_boltz2_init)
     def _init_with_validators(self, *args, **kwargs):
         if kwargs.get("validate_structure", False) and not kwargs.get("validators"):
-            kwargs["validators"] = [RCSBValidator(val_names=["RCSB"], confidence_prediction=False)]
+            kwargs["validators"] = [
+                RCSBValidator(val_names=["RCSB"], confidence_prediction=False, physicalism_metrics=True)
+            ]
         _orig_serial_boltz2_init(self, *args, **kwargs)
 
     serial_mp.setattr(SerialBoltz2, "__init__", _init_with_validators)
@@ -1606,8 +1560,151 @@ def _e2e_model_dict(
                 "_target_": _validator_target,
                 "val_names": ["RCSB"],
                 "confidence_prediction": False,
+                "physicalism_metrics": True,
             }
         ]
+    return d
+
+
+def _confidence_model_dict(
+    *,
+    ema: bool = True,
+    ema_decay: float = 0.999,
+    multiplicity: int = 1,
+    distributed: bool = False,
+) -> dict[str, Any]:
+    """Small model config dict for the E2E confidence training parity test.
+
+    Sets ``structure_prediction_training=False``, ``confidence_prediction=True``,
+    ``alpha_pae=1.0``, with a single-block confidence pairformer.
+    ``symmetry_correction=False`` keeps ``true_coords`` on the non-symmetry code
+    path (avoids the ``shardwise_unsqueeze`` / ``shardwise_squeeze`` round-trip).
+
+    When ``distributed=True``, the validator uses
+    :class:`DistributedRCSBValidator` (the DTensor-aware variant required by
+    ``Boltz2Distributed``).
+    """
+    d: dict[str, Any] = {
+        "_target_": "boltz.model.models.boltz2.Boltz2",
+        "atom_s": 4,
+        "atom_z": 4,
+        "token_s": 4,
+        "token_z": 4,
+        "num_bins": 64,
+        "atom_feature_dim": 388,
+        "atoms_per_window_queries": 32,
+        "atoms_per_window_keys": 128,
+        "ema": ema,
+        "ema_decay": ema_decay,
+        "confidence_prediction": True,
+        "affinity_prediction": False,
+        "structure_prediction_training": False,
+        "use_templates": False,
+        "validate_structure": True,
+        "predict_bfactor": False,
+        "bond_type_feature": False,
+        "no_random_recycling_training": True,
+        # alpha_pae=1 matches confidencev2.yaml (exercises PAE loss path).
+        "alpha_pae": 1.0,
+        "embedder_args": {
+            "atom_encoder_depth": 1,
+            "atom_encoder_heads": 1,
+            "activation_checkpointing": False,
+        },
+        "msa_args": {
+            "msa_s": 4,
+            "msa_blocks": 1,
+            "msa_dropout": 0.0,
+            "z_dropout": 0.0,
+            "use_paired_feature": True,
+        },
+        "pairformer_args": {
+            "num_blocks": 1,
+            "num_heads": 1,
+            "dropout": 0.0,
+            "v2": True,
+        },
+        "score_model_args": {
+            "sigma_data": 16.0,
+            "dim_fourier": 4,
+            "atom_encoder_depth": 1,
+            "atom_encoder_heads": 1,
+            "token_transformer_depth": 1,
+            "token_transformer_heads": 1,
+            "atom_decoder_depth": 1,
+            "atom_decoder_heads": 1,
+            "activation_checkpointing": False,
+            "conditioning_transition_layers": 1,
+        },
+        "diffusion_process_args": {
+            "coordinate_augmentation": False,
+            # Match confidencev2.yaml: synchronize_sigmas=true for confidence training.
+            "synchronize_sigmas": True,
+        },
+        "diffusion_loss_args": {},
+        # Mirror confidencev2.yaml confidence_model_args: s/z input mixing,
+        # distance-bin inputs, and separate inter/intra confidence heads.
+        "confidence_model_args": {
+            "num_dist_bins": 64,
+            "max_dist": 22,
+            "add_s_to_z_prod": True,
+            "add_s_input_to_s": True,
+            "add_z_input_to_z": True,
+            "pairformer_args": {
+                "num_blocks": 1,
+                "num_heads": 1,
+                "dropout": 0.0,
+                "activation_checkpointing": False,
+            },
+            "confidence_args": {
+                "use_separate_heads": True,
+            },
+        },
+        "training_args": {
+            "recycling_steps": 0,
+            "sampling_steps": 2,
+            "diffusion_multiplicity": multiplicity,
+            "diffusion_samples": 1,
+            "diffusion_loss_weight": 0.0,
+            "distogram_loss_weight": 0.0,
+            "confidence_loss_weight": 3e-3,
+            "bfactor_loss_weight": 0.0,
+            "symmetry_correction": False,
+            "adam_beta_1": 0.9,
+            "adam_beta_2": 0.95,
+            "adam_eps": 1e-8,
+            "lr_scheduler": "af3",
+            "base_lr": 1e-4,
+            "max_lr": 1e-4,
+            "lr_warmup_no_steps": 10,
+            "lr_start_decay_after_n_steps": 100,
+            "lr_decay_every_n_steps": 50000,
+            "lr_decay_factor": 0.95,
+            "weight_decay": 0.003,
+        },
+        "validation_args": {
+            "recycling_steps": 0,
+            "sampling_steps": 2,
+            "diffusion_samples": 1,
+            "symmetry_correction": False,
+            # run_confidence_sequentially=True matches confidencev2.yaml validation_args.
+            "run_confidence_sequentially": True,
+        },
+    }
+    d["num_val_datasets"] = 1
+    _validator_target = (
+        "boltz.distributed.model.validation.rcsb.DistributedRCSBValidator"
+        if distributed
+        else "boltz.model.validation.rcsb.RCSBValidator"
+    )
+    d["validators"] = [
+        {
+            "_target_": _validator_target,
+            "val_names": ["RCSB"],
+            "confidence_prediction": True,
+            "physicalism_metrics": False,
+        }
+    ]
     return d
 
 
@@ -1644,19 +1741,105 @@ def _apply_e2e_deterministic_getitem(monkeypatch, base_seed: int = 42) -> None:
     monkeypatch.setattr(SerialTrainingDataset, "__getitem__", _wrapped_getitem)
 
 
+def _strip_serial_prefix(d: dict) -> dict:
+    """Strip the ``_serial.`` key prefix added by the DTensor model wrapper."""
+    return {(k[len("_serial.") :] if k.startswith("_serial.") else k): v for k, v in d.items()}
+
+
+def _make_det_noise_setup(
+    noise_global_host: torch.Tensor,
+    atom_counts_per_token_host: torch.Tensor,
+) -> tuple[list[bool], Any]:
+    """Return ``(_dist_in_val, _det_create_randn)`` for deterministic noise injection.
+
+    ``_dist_in_val[0]`` must be set ``True`` inside ``validation_step`` and
+    restored in a ``finally`` block so that noise during validation is zeroed
+    out while training noise replays the pre-generated host tensor.
+
+    Noise must go through ``distribute_atom_features`` (intersperse padding)
+    so that ``noise[i]`` in the distributed tensor corresponds to the same atom
+    as ``coords[i]``.  Plain ``distribute_tensor`` would keep serial ordering
+    while coords use the intersperse-padded ordering, causing a mismatch.
+    """
+    _noise_dt_cache: list[Any] = [None]
+    _noise_computed = [False]
+    _dist_in_val: list[bool] = [False]
+
+    def _compute_noise_dt_once(device_mesh: Any, dtype: torch.dtype) -> None:
+        if _noise_computed[0]:
+            return
+        _noise_computed[0] = True
+
+        manager = DistributedManager()
+        _io_keys = {"noise"}
+        _placements = get_feature_placements(
+            atom_keys=set(),
+            model_io_keys=_io_keys,
+            model_io_fp32_keys=set(),
+        )
+
+        size_batch = atom_counts_per_token_host.shape[0]
+        multiplicity_val = noise_global_host.shape[0] // size_batch
+        noise_unflat = noise_global_host.unflatten(0, (size_batch, multiplicity_val))
+
+        inputs_io: dict[str, torch.Tensor] = {"atom_counts_per_token": atom_counts_per_token_host.clone()}
+        for i_mul in range(multiplicity_val):
+            inputs_io[f"noise_{i_mul}"] = noise_unflat[:, i_mul].to(dtype=dtype)
+
+        placements_cp_model_io_mul = {
+            f"{k}_{i_mul}": v for k, v in _placements["cp_model_io"].items() for i_mul in range(multiplicity_val)
+        }
+        placements_cp = _placements["cp_atom_features"] | placements_cp_model_io_mul
+        placements_model_io_mul = {
+            f"{k}_{i_mul}": v for k, v in _placements["model_io"].items() for i_mul in range(multiplicity_val)
+        }
+
+        io_feats = distribute_atom_features(
+            inputs=inputs_io,
+            placements_cp=placements_cp,
+            placements_dp_cp=placements_model_io_mul,
+            device_mesh=manager.device_mesh_subgroups,
+            cp_group=manager.group["cp"],
+            multiplicities={"noise": multiplicity_val},
+        )
+        _noise_dt_cache[0] = io_feats.pop("noise").to(dtype=dtype)
+
+    def _det_create_randn(
+        shape: Any,
+        device_mesh: Any,
+        placements: Any,
+        dtype: torch.dtype = torch.float32,
+        scale: float = 1.0,
+    ) -> Any:
+        if _dist_in_val[0]:
+            return _real_create_distributed_randn(shape, device_mesh, placements, dtype=dtype, scale=0.0)
+        from boltz.testing.utils import pad_to_length as _pad
+
+        _compute_noise_dt_once(device_mesh, dtype)
+        n = _noise_dt_cache[0]
+        if n.dtype != dtype:
+            n = n.to(dtype=dtype)
+        if len(shape) > 1 and n.shape[1] < shape[1]:
+            n = _pad(n, dim=1, length=shape[1])
+        return n * scale
+
+    return _dist_in_val, _det_create_randn
+
+
 def _apply_cached_getitem(monkeypatch, cache_path: str | Path) -> None:
     """Replace ``TrainingDataset.__getitem__`` with a disk-backed cache lookup.
 
-    The cache file (created during pre-load) maps integer sample indices to
-    feature dicts, guaranteeing identical features across serial and
-    distributed data pipelines regardless of data-processing RNG state.
+    Indices wrap mod cache size so dp>1 runs (which request idx in
+    ``[0, samples_per_epoch=dp)``) replay the same B cached samples on every
+    DP rank — each DP rank trains on the same fixed set, so the DP-averaged
+    gradient equals the serial single-sample gradient.
     """
     _cache: dict[int, dict] = {}
 
     def _cached_getitem(self, idx):
         if not _cache:
             _cache.update(torch.load(str(cache_path), map_location="cpu", weights_only=False))
-        return _cache[idx]
+        return _cache[idx % len(_cache)]
 
     monkeypatch.setattr(SerialTrainingDataset, "__getitem__", _cached_getitem)
 
@@ -1697,77 +1880,13 @@ def _worker_e2e_training_parity(
     _apply_cached_getitem(monkeypatch, cached_samples_path)
 
     # --- Deterministic noise (distributed) ---
-    # Noise must go through distribute_atom_features (intersperse padding) so
-    # that noise[i] at position i in the distributed tensor corresponds to the
-    # same atom as coords[i].  Plain distribute_tensor would keep serial ordering
-    # while coords use the intersperse-padded ordering, causing a mismatch.
     def _dist_noise_dist(self, bs, dtype=torch.float32):
         s = sigmas_global_host.to(device=self.device_mesh.device_type, dtype=dtype)[:bs]
         return distribute_tensor(s, self.device_mesh, (Shard(0), Replicate(), Replicate()))
 
     monkeypatch.setattr(DistAtomDiffusionV2, "noise_distribution", _dist_noise_dist)
 
-    _noise_dt_cache: list[DTensor | None] = [None]
-    _noise_computed = [False]
-
-    def _compute_noise_dt_once(device_mesh, dtype):
-        """Compute noise DTensor via distribute_atom_features (intersperse padding)."""
-        if _noise_computed[0]:
-            return
-        _noise_computed[0] = True
-
-        manager = DistributedManager()
-        _io_keys = {"noise"}
-        _placements = get_feature_placements(
-            atom_keys=set(),
-            model_io_keys=_io_keys,
-            model_io_fp32_keys=set(),
-        )
-
-        size_batch = atom_counts_per_token_host.shape[0]
-        multiplicity_val = noise_global_host.shape[0] // size_batch
-        noise_unflat = noise_global_host.unflatten(0, (size_batch, multiplicity_val))
-
-        inputs_io = {"atom_counts_per_token": atom_counts_per_token_host.clone()}
-        for i_mul in range(multiplicity_val):
-            inputs_io[f"noise_{i_mul}"] = noise_unflat[:, i_mul].to(dtype=dtype)
-
-        placements_cp_model_io_mul = {
-            f"{k}_{i_mul}": v for k, v in _placements["cp_model_io"].items() for i_mul in range(multiplicity_val)
-        }
-        placements_cp = _placements["cp_atom_features"] | placements_cp_model_io_mul
-        placements_model_io_mul = {
-            f"{k}_{i_mul}": v for k, v in _placements["model_io"].items() for i_mul in range(multiplicity_val)
-        }
-        placements_dp_cp = placements_model_io_mul
-
-        io_feats = distribute_atom_features(
-            inputs=inputs_io,
-            placements_cp=placements_cp,
-            placements_dp_cp=placements_dp_cp,
-            device_mesh=manager.device_mesh_subgroups,
-            cp_group=manager.group["cp"],
-            multiplicities={"noise": multiplicity_val},
-        )
-        _noise_dt_cache[0] = io_feats.pop("noise").to(dtype=dtype)
-
-    _dist_in_val = [False]
-
-    def _det_create_randn(shape, device_mesh, placements, dtype=torch.float32, scale=1.0):
-        if _dist_in_val[0]:
-            from boltz.distributed.utils import create_distributed_randn as _real_create_randn
-
-            return _real_create_randn(shape, device_mesh, placements, dtype=dtype, scale=0.0)
-        from boltz.testing.utils import pad_to_length as _pad
-
-        _compute_noise_dt_once(device_mesh, dtype)
-        n = _noise_dt_cache[0]
-        if n.dtype != dtype:
-            n = n.to(dtype=dtype)
-        if len(shape) > 1 and n.shape[1] < shape[1]:
-            n = _pad(n, dim=1, length=shape[1])
-        return n * scale
-
+    _dist_in_val, _det_create_randn = _make_det_noise_setup(noise_global_host, atom_counts_per_token_host)
     monkeypatch.setattr(dist_diffusion_module, "create_distributed_randn", _det_create_randn)
 
     _orig_dist_val_step = Boltz2Distributed.validation_step
@@ -1821,17 +1940,14 @@ def _worker_e2e_training_parity(
     assert len(serial_sd) > 0, f"Rank {rank}: serial state_dict is empty"
 
     # The distributed model prefixes keys with ``_serial.``; strip it for comparison.
-    dist_sd_mapped = {}
-    for k, v in dist_sd.items():
-        canonical_k = k.replace("_serial.", "", 1) if k.startswith("_serial.") else k
-        dist_sd_mapped[canonical_k] = v
+    dist_sd_mapped = _strip_serial_prefix(dist_sd)
 
     for k in serial_sd:
         assert k in dist_sd_mapped, f"Rank {rank}: key '{k}' missing from distributed checkpoint"
         torch.testing.assert_close(
             dist_sd_mapped[k],
             serial_sd[k],
-            msg=lambda m: f"Rank {rank}: state_dict mismatch on '{k}': {m}",
+            msg=lambda m, _k=k: f"Rank {rank}: state_dict mismatch on '{_k}': {m}",
         )
 
     # --- EMA weight parity ---
@@ -1844,17 +1960,14 @@ def _worker_e2e_training_parity(
         f"dist={dist_ckpt['ema']['cur_step']}, serial={serial_ckpt['ema']['cur_step']}"
     )
 
-    dist_ema_mapped = {}
-    for k, v in dist_ema.items():
-        canonical_k = k.replace("_serial.", "", 1) if k.startswith("_serial.") else k
-        dist_ema_mapped[canonical_k] = v
+    dist_ema_mapped = _strip_serial_prefix(dist_ema)
 
     for k in serial_ema:
         assert k in dist_ema_mapped, f"Rank {rank}: EMA key '{k}' missing from distributed checkpoint"
         torch.testing.assert_close(
             dist_ema_mapped[k],
             serial_ema[k],
-            msg=lambda m: f"Rank {rank}: EMA weight mismatch on '{k}': {m}",
+            msg=lambda m, _k=k: f"Rank {rank}: EMA weight mismatch on '{_k}': {m}",
         )
 
     # --- Non-vacuous guard: at least one parameter changed from pretrained init ---
@@ -1876,7 +1989,7 @@ def _worker_e2e_training_parity(
     # we use relaxed tolerance (atol=5e-4) for these forward-pass-dependent
     # metrics and default tolerance for everything else.  Trailing underscore
     # omitted so "val/lddt" (global) is also matched.
-    _forward_dependent_prefixes = ("val/lddt", "val/complex_lddt")
+    _forward_dependent_prefixes = ("val/lddt", "val/complex_lddt", "val/clash", "val/pb", "val/rmsd")
     _lddt_keys_compared = []
     if serial_metrics:
         for k in serial_metrics:
@@ -1889,13 +2002,13 @@ def _worker_e2e_training_parity(
                         exp,
                         atol=5e-4,
                         rtol=0.02,
-                        msg=lambda m: f"Rank {rank}: metric '{k}' mismatch: {m}",
+                        msg=lambda m, _k=k: f"Rank {rank}: metric '{_k}' mismatch: {m}",
                     )
                 else:
                     torch.testing.assert_close(
                         got,
                         exp,
-                        msg=lambda m: f"Rank {rank}: metric '{k}' mismatch: {m}",
+                        msg=lambda m, _k=k: f"Rank {rank}: metric '{_k}' mismatch: {m}",
                     )
                 if "lddt" in k:
                     _lddt_keys_compared.append(k)
@@ -1923,6 +2036,269 @@ def _worker_e2e_training_parity(
         assert (
             _captured_metrics[gn_key] > 0
         ), f"Rank {rank}: '{gn_key}' is zero — gradients should be non-zero after training"
+
+    torch.distributed.barrier()
+
+
+def _worker_e2e_confidence_training_parity(
+    rank: int,
+    grid_group_sizes: dict,
+    device_type: str,
+    backend: str,
+    env_per_rank: dict[str, Any],
+    dist_config_path: str,
+    dist_output_dir: str,
+    serial_ckpt_path: str,
+    pretrained_ckpt_path: str,
+    serial_metrics: dict,
+    sigmas_global_host: torch.Tensor,
+    noise_global_host: torch.Tensor,
+    atom_counts_per_token_host: torch.Tensor,
+    cached_samples_path: str,
+    seed: int,
+    R_fixed_host: torch.Tensor,
+    tr_fixed_host: torch.Tensor,
+) -> None:
+    """Multi-rank worker: distributed confidence train() then compare with serial checkpoint.
+
+    Analogous to ``_worker_e2e_training_parity`` but adapted for
+    confidence-only training (``structure_prediction_training=False``).
+
+    - ``train/grad_norm_confidence_module`` must be non-zero.
+    - ``train/grad_norm_{msa,pairformer,structure}_module`` are present but
+      expected to be zero (frozen trunk).
+    - ``train/confidence_loss`` must be positive.
+    - ``confidence_module.*`` state_dict keys must differ from pretrained init.
+    - Trunk params must be unchanged from pretrained init (frozen by
+      ``structure_prediction_training=False``).
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    if env_per_rank is not None:
+        for var_name, value in env_per_rank.items():
+            monkeypatch.setenv(var_name, f"{rank}" if value == "<INPUT_RANK>" else value)
+
+    monkeypatch.setattr(train_module, "_cleanup_distributed", lambda: None)
+    DistributedManager._state = {}
+
+    # --- Deterministic data loading via cached samples ---
+    _apply_cached_getitem(monkeypatch, cached_samples_path)
+
+    # --- Deterministic noise (distributed) ---
+    def _dist_noise_dist(self, bs, dtype=torch.float32):
+        s = sigmas_global_host.to(device=self.device_mesh.device_type, dtype=dtype)[:bs]
+        return distribute_tensor(s, self.device_mesh, (Shard(0), Replicate(), Replicate()))
+
+    monkeypatch.setattr(DistAtomDiffusionV2, "noise_distribution", _dist_noise_dist)
+
+    _dist_in_val, _det_create_randn = _make_det_noise_setup(noise_global_host, atom_counts_per_token_host)
+    monkeypatch.setattr(dist_diffusion_module, "create_distributed_randn", _det_create_randn)
+
+    _orig_dist_val_step = Boltz2Distributed.validation_step
+
+    def _dist_val_step_wrapper(self_model, batch, batch_idx):
+        _dist_in_val[0] = True
+        try:
+            return _orig_dist_val_step(self_model, batch, batch_idx)
+        finally:
+            _dist_in_val[0] = False
+
+    monkeypatch.setattr(Boltz2Distributed, "validation_step", _dist_val_step_wrapper)
+
+    # Replay pre-generated R, tr for the dist sampler's per-step augmentation
+    # so it matches the serial side exactly (and is bit-identical across DP).
+    def _shared_random_rotations(n, dtype=torch.float32, device=None):
+        return R_fixed_host[:n].to(device=device, dtype=dtype)
+
+    monkeypatch.setattr(dist_utils_module, "random_rotations", _shared_random_rotations)
+
+    def _shared_create_dist_randn_in_utils(shape, device_mesh, placements, dtype=torch.float32, scale=1.0):
+        # The only call we expect to hit this patch is the translation generator
+        # inside ``center_random_augmentation`` (shape ``(B, 1, 3)``).  Other
+        # callers go through ``dist_diffusion_module.create_distributed_randn``
+        # which is patched separately.
+        if not (len(shape) == 3 and shape[1] == 1 and shape[2] == 3 and shape[0] <= tr_fixed_host.shape[0]):
+            return _real_create_distributed_randn(shape, device_mesh, placements, dtype=dtype, scale=scale)
+        tr_local = (tr_fixed_host[: shape[0]] * scale).to(device=torch.device(device_mesh.device_type), dtype=dtype)
+        return DTensor.from_local(tr_local, device_mesh=device_mesh, placements=placements, shape=shape)
+
+    monkeypatch.setattr(dist_utils_module, "create_distributed_randn", _shared_create_dist_randn_in_utils)
+
+    # --- Capture trainer metrics ---
+    _captured_metrics: dict[str, float] = {}
+    _orig_fit = pl.Trainer.fit
+
+    def _capturing_fit(self, *args, **kwargs):
+        result = _orig_fit(self, *args, **kwargs)
+        for k, v in self.callback_metrics.items():
+            if isinstance(v, DTensor):
+                _captured_metrics[k] = v.full_tensor().detach().cpu().item()
+            elif isinstance(v, torch.Tensor):
+                _captured_metrics[k] = v.detach().cpu().item()
+            else:
+                _captured_metrics[k] = v
+        return result
+
+    monkeypatch.setattr(pl.Trainer, "fit", _capturing_fit)
+
+    # --- Run distributed training ---
+    train_module.train(dist_config_path, [])
+
+    # --- Load checkpoints and compare ---
+    dist_ckpt_path = Path(dist_output_dir) / "last.ckpt"
+    assert dist_ckpt_path.exists(), f"Rank {rank}: distributed checkpoint not found at {dist_ckpt_path}"
+    dist_ckpt = torch.load(dist_ckpt_path, map_location="cpu", weights_only=False)
+    serial_ckpt = torch.load(serial_ckpt_path, map_location="cpu", weights_only=False)
+
+    dist_sd = dist_ckpt["state_dict"]
+    serial_sd = serial_ckpt["state_dict"]
+    assert len(dist_sd) > 0, f"Rank {rank}: distributed state_dict is empty"
+    assert len(serial_sd) > 0, f"Rank {rank}: serial state_dict is empty"
+
+    # The distributed model prefixes keys with ``_serial.``; strip it for comparison.
+    dist_sd_mapped = _strip_serial_prefix(dist_sd)
+
+    for k in serial_sd:
+        assert k in dist_sd_mapped, f"Rank {rank}: key '{k}' missing from distributed checkpoint"
+        torch.testing.assert_close(
+            dist_sd_mapped[k],
+            serial_sd[k],
+            msg=lambda m, _k=k: f"Rank {rank}: state_dict mismatch on '{_k}': {m}",
+        )
+
+    # --- EMA weight parity ---
+    assert "ema" in dist_ckpt, f"Rank {rank}: distributed checkpoint missing EMA state"
+    assert "ema" in serial_ckpt, f"Rank {rank}: serial checkpoint missing EMA state"
+    dist_ema = dist_ckpt["ema"]["ema_weights"]
+    serial_ema = serial_ckpt["ema"]["ema_weights"]
+    assert dist_ckpt["ema"]["cur_step"] == serial_ckpt["ema"]["cur_step"], (
+        f"Rank {rank}: EMA cur_step mismatch: "
+        f"dist={dist_ckpt['ema']['cur_step']}, serial={serial_ckpt['ema']['cur_step']}"
+    )
+
+    dist_ema_mapped = _strip_serial_prefix(dist_ema)
+
+    for k in serial_ema:
+        assert k in dist_ema_mapped, f"Rank {rank}: EMA key '{k}' missing from distributed checkpoint"
+        torch.testing.assert_close(
+            dist_ema_mapped[k],
+            serial_ema[k],
+            msg=lambda m, _k=k: f"Rank {rank}: EMA weight mismatch on '{_k}': {m}",
+        )
+
+    # --- Non-vacuous guard: confidence_module params must change from pretrained ---
+    pretrained_sd = torch.load(
+        pretrained_ckpt_path,
+        map_location="cpu",
+        weights_only=False,
+    ).get("state_dict", {})
+    if pretrained_sd:
+        conf_changed = any(
+            not torch.equal(serial_sd[k], pretrained_sd[k])
+            for k in serial_sd
+            if k.startswith("confidence_module.") and k in pretrained_sd
+        )
+        assert conf_changed, f"Rank {rank}: no confidence_module params changed from pretrained init — test is vacuous"
+
+        # Trunk params (frozen by structure_prediction_training=False) must be unchanged.
+        # The serial model freezes all params not in confidence_module / affinity_module
+        # and not matching "out_token_feat_update" (see boltz2.py:371-376).
+        trunk_changed = any(
+            not torch.equal(serial_sd[k], pretrained_sd[k])
+            for k in serial_sd
+            if k in pretrained_sd
+            and not k.startswith(("confidence_module.", "affinity_module."))
+            and "out_token_feat_update" not in k
+        )
+        assert not trunk_changed, f"Rank {rank}: trunk params changed but should be frozen in confidence-only training"
+
+    # --- Metric parity ---
+    # ``val/lddt``-family metrics flow through the diffusion sampler whose
+    # output drifts ~3e-3 rel between serial and dist because the two
+    # featurizers emit different atom-dim sizes (max_atoms vs
+    # max_atoms_per_shard).  ``test_boltz2_validation_step_parity_confidence``
+    # covers these at FP64; here we use the same relaxed tolerance as the
+    # structure e2e parity test (``atol=5e-4, rtol=0.02``).  State dict, EMA,
+    # and all non-val/* metrics still use ``assert_close`` defaults.
+    _forward_dependent_prefixes = ("val/lddt", "val/complex_lddt", "val/clash", "val/pb", "val/rmsd")
+    _lddt_keys_compared = []
+    _metric_failures: list[str] = []
+    if serial_metrics:
+        for k in serial_metrics:
+            # Every serial-emitted metric must also be emitted by the
+            # distributed run.  Silent skip on missing keys would let
+            # accidental dist-side omissions go undetected.
+            assert k in _captured_metrics, (
+                f"Rank {rank}: serial metric '{k}' missing from distributed metrics. "
+                f"Distributed metrics: {sorted(_captured_metrics)}"
+            )
+            got = torch.tensor(_captured_metrics[k])
+            exp = torch.tensor(serial_metrics[k])
+            try:
+                if any(k.startswith(p) for p in _forward_dependent_prefixes):
+                    torch.testing.assert_close(got, exp, atol=5e-4, rtol=0.02)
+                else:
+                    torch.testing.assert_close(got, exp)
+            except AssertionError as exc:
+                _metric_failures.append(f"metric '{k}' mismatch: {exc}")
+            if "lddt" in k:
+                _lddt_keys_compared.append(k)
+
+    if _metric_failures:
+        head = f"Rank {rank}: {len(_metric_failures)} metric mismatch(es):"
+        body = "\n".join(f"  - {f}" for f in _metric_failures)
+        raise AssertionError(f"{head}\n{body}")
+
+    assert _lddt_keys_compared, (
+        f"Rank {rank}: no validation LDDT metrics were compared — test is vacuous. "
+        f"Serial keys: {sorted(serial_metrics)}, dist keys: {sorted(_captured_metrics)}"
+    )
+    for required_metric in ("val/lddt", "val/disto_lddt", "val/complex_lddt"):
+        assert (
+            required_metric in _captured_metrics
+        ), f"Rank {rank}: distributed metrics missing '{required_metric}' — available: {sorted(_captured_metrics)}"
+
+    # --- Confidence-specific val metric guard ---
+    # Ensures DistributedRCSBValidator actually computed and logged confidence
+    # head outputs (plddt MAE).  Without this guard a broken confidence validator
+    # that silently skips plddt computation would go undetected because the
+    # diffusion-head LDDT metrics above are produced by a different code path.
+    conf_val_keys = [k for k in _captured_metrics if k.startswith("val/MAE_plddt_")]
+    assert conf_val_keys, (
+        f"Rank {rank}: no confidence val metrics (val/MAE_plddt_*) in distributed output "
+        f"— DistributedRCSBValidator confidence metrics not logged. "
+        f"Available: {sorted(_captured_metrics)}"
+    )
+
+    # --- Confidence training guard: confidence loss must be non-zero ---
+    assert (
+        "train/confidence_loss" in _captured_metrics
+    ), f"Rank {rank}: 'train/confidence_loss' not in metrics — available: {sorted(_captured_metrics)}"
+    assert (
+        _captured_metrics["train/confidence_loss"] > 0
+    ), f"Rank {rank}: train/confidence_loss={_captured_metrics['train/confidence_loss']:.6f} — should be > 0"
+
+    # --- Grad norm checks ---
+    # Overall grad norm and confidence_module grad norm must be non-zero.
+    # Trunk module grad norms (msa, pairformer, structure) are zero because
+    # requires_grad=False is set by structure_prediction_training=False.
+    for gn_key in ("train/grad_norm", "train/grad_norm_confidence_module"):
+        assert (
+            gn_key in _captured_metrics
+        ), f"Rank {rank}: metrics missing '{gn_key}' — available: {sorted(_captured_metrics)}"
+        assert (
+            _captured_metrics[gn_key] > 0
+        ), f"Rank {rank}: '{gn_key}' is zero — confidence_module gradients should be non-zero"
+
+    for frozen_key in (
+        "train/grad_norm_msa_module",
+        "train/grad_norm_pairformer_module",
+        "train/grad_norm_structure_module",
+    ):
+        if frozen_key in _captured_metrics:
+            assert _captured_metrics[frozen_key] == 0, (
+                f"Rank {rank}: '{frozen_key}' = {_captured_metrics[frozen_key]:.6f}"
+                f" — should be zero (trunk is frozen by structure_prediction_training=False)"
+            )
 
     torch.distributed.barrier()
 
@@ -2018,7 +2394,7 @@ def test_boltz2_e2e_training_parity(
     model_dict = _e2e_model_dict(multiplicity=multiplicity, validate_structure=True)
     model_dict.pop("_target_")
     model_dict.pop("validators", None)
-    _val_validators = [RCSBValidator(val_names=["RCSB"], confidence_prediction=False)]
+    _val_validators = [RCSBValidator(val_names=["RCSB"], confidence_prediction=False, physicalism_metrics=True)]
     pretrained_model = SerialBoltz2(**model_dict, validators=_val_validators)
     init_module_params_glorot(pretrained_model, gain=scale_glorot)
     pretrained_model.apply(SetModuleInfValues())
@@ -2131,7 +2507,9 @@ def test_boltz2_e2e_training_parity(
     @functools.wraps(_orig_serial_boltz2_init)
     def _init_with_validators(self, *args, **kwargs):
         if kwargs.get("validate_structure", False) and not kwargs.get("validators"):
-            kwargs["validators"] = [RCSBValidator(val_names=["RCSB"], confidence_prediction=False)]
+            kwargs["validators"] = [
+                RCSBValidator(val_names=["RCSB"], confidence_prediction=False, physicalism_metrics=True)
+            ]
         _orig_serial_boltz2_init(self, *args, **kwargs)
 
     serial_mp.setattr(SerialBoltz2, "__init__", _init_with_validators)
@@ -2276,6 +2654,523 @@ def test_boltz2_e2e_training_parity(
         atom_counts_per_token_host,
         str(cached_samples_path),
         seed,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "setup_env",
+    [
+        # Full multi-axis: dp=2, cp=2x2, world_size=8 — exercises both DP and
+        # CP collective code paths together.
+        ((2, (2, 2)), True, "cuda", "ENV"),
+    ],
+    indirect=("setup_env",),
+    ids=["cuda-dp2-cp2x2"],
+)
+def test_boltz2_e2e_confidence_training_parity(
+    setup_env,
+    test_cp_training_base_data_dir_boltz2,
+    canonical_mols_dir,
+    tmp_path,
+):
+    """E2E serial-vs-DTensor confidence training parity via ``train()`` entry points.
+
+    Mirrors ``test_boltz2_e2e_training_parity`` for confidence fine-tuning
+    (``structure_prediction_training=False``, ``confidence_prediction=True``).
+
+    Both serial and distributed training go through their respective ``train()``
+    functions for 1 epoch (7ylz+8b2e train, 7z64+8ayv val), then compare
+    checkpoints and logged metrics.
+
+    Key differences from the structure parity test:
+
+    - Only ``confidence_module`` parameters receive gradient updates; trunk
+      params are frozen (``requires_grad=False``).
+    - Loss is ``confidence_loss_weight * confidence_loss`` only (subgraph
+      trick); ``diffusion_loss_weight=distogram_loss_weight=0``.
+    - ``symmetry_correction=False`` keeps ``true_coords`` on the direct
+      ``batch["coords"]`` path (avoids ``shardwise_unsqueeze`` / squeeze).
+    - Noise/sigma determinism is still required because the forward pass runs
+      diffusion sampling to produce ``sample_atom_coords`` for the confidence
+      head.
+    - Uses dp=1 (not dp=2) because the serial boltz2 model's
+      ``get_true_coordinates`` asserts batch_size==1; with dp>1 the serial
+      config would need batch_size>1, which breaks that assertion.  DP=2 is
+      covered by unit tests V19 and V20 which do per-sample comparisons.
+
+    Non-vacuous guards:
+    - ``train/confidence_loss > 0``
+    - ``train/grad_norm_confidence_module > 0``
+    - At least one ``confidence_module.*`` key differs from pretrained init.
+    - Trunk params unchanged from pretrained init.
+
+    Known coverage gaps:
+    - ``symmetry_correction=True`` (the ``if true_coords.ndim == 4:
+      shardwise_squeeze(true_coords, dim=1)`` guard at boltz2.py:830)
+      is not exercised here.  See
+      ``test_boltz2_confidence_4d_true_coords_squeeze`` for the
+      dedicated unit test that covers that path.
+    - bf16 coordinate dtype in ``cdist_pde`` is covered by the
+      ``coord_dtype=bf16`` parametrization in
+      ``tests/distributed/model/loss/test_cdist_pde_triton.py``.
+    """
+    grid_group_sizes, world_size, device_type, backend, _, env_per_rank = setup_env
+
+    if device_type == "cuda":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        if torch.cuda.device_count() < world_size:
+            pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+
+    # dp pulled up here because host-side scratch buffers (noise, atom counts)
+    # must be sized for ``B*dp`` (the dist runtime asserts
+    # ``batch_size == dp_world_size`` in pad_and_scatter_atom_features_dtensor).
+    dp = grid_group_sizes["dp"]
+
+    dtype = torch.float32
+    seed = 42
+    multiplicity = 1
+    # B=1: serial get_true_coordinates asserts batch_size==1 (confidence training
+    # processes samples one at a time).  DP=2 is tested at the unit level by V19/V20.
+    B = 1
+    max_tokens = 256
+    W = 32  # atoms_per_window_queries
+    size_cp = grid_group_sizes["cp"][0] * grid_group_sizes["cp"][1]
+    atom_align = math.lcm(W, size_cp)
+    max_atoms = ((max_tokens * 10 + atom_align - 1) // atom_align) * atom_align
+    max_seqs = 16
+    scale_glorot = 0.05
+
+    # --- Merge all 4 samples with train/val split ---
+    training_data_dir, split_file = _setup_training_data_all_4_e2e(
+        tmp_path / "training_data", test_cp_training_base_data_dir_boltz2
+    )
+
+    # --- Create pretrained checkpoint with confidence module initialised ---
+    seed_by_rank(0, seed=seed)
+    model_dict = _confidence_model_dict(multiplicity=multiplicity)
+    model_dict.pop("_target_")
+    model_dict.pop("validators", None)
+    _val_validators = [RCSBValidator(val_names=["RCSB"], confidence_prediction=True, physicalism_metrics=False)]
+    pretrained_model = SerialBoltz2(**model_dict, validators=_val_validators)
+    init_module_params_glorot(pretrained_model, gain=scale_glorot)
+    pretrained_model.apply(SetModuleInfValues())
+    # Augmentation ON: both sides replay R_fixed_host / tr_fixed_host so the
+    # rotation+translation code path is exercised deterministically.
+    pretrained_model.structure_module.coordinate_augmentation = True
+    pretrained_model = pretrained_model.to(dtype=dtype)
+
+    pretrained_path = tmp_path / "pretrained.ckpt"
+    torch.save(
+        {
+            "state_dict": pretrained_model.state_dict(),
+            "pytorch-lightning_version": pl.__version__,
+            "hyper_parameters": pretrained_model.hparams,
+        },
+        pretrained_path,
+    )
+
+    # --- Pre-load and cache individual samples to disk ---
+    _tmp_mp = pytest.MonkeyPatch()
+    _apply_e2e_deterministic_getitem(_tmp_mp, base_seed=seed)
+    _preload_cfg = setup_mock_training_datamodule_config(training_data_dir)
+    _preload_cfg.batch_size = B
+    _preload_cfg.samples_per_epoch = B
+    _preload_cfg.moldir = str(canonical_mols_dir)
+    _preload_cfg.return_train_symmetries = False
+    _preload_cfg.msa_sampling_training = False
+    _preload_cfg.max_tokens = max_tokens
+    _preload_cfg.max_atoms = max_atoms
+    _preload_cfg.max_seqs = max_seqs
+    _preload_cfg.compute_frames = True
+    for _ds in _preload_cfg.datasets:
+        _ds.filters = None
+        _ds.split = str(split_file)
+        _ds.symmetry_correction = False
+    seed_by_rank(0, seed=seed)
+    _preload_dm = Boltz2TrainingDataModule(cfg=_preload_cfg)
+
+    _preload_ds = _preload_dm._train_set
+    _cached_samples = {i: _preload_ds[i] for i in range(B)}
+    cached_samples_path = tmp_path / "cached_samples.pt"
+    torch.save(_cached_samples, cached_samples_path)
+
+    _preload_dl = _preload_dm.train_dataloader()
+    _preload_batch = next(iter(_preload_dl))
+    atom_counts_per_token_host = _preload_batch["atom_counts_per_token"].detach().cpu()
+    atom_pad_mask_host = _preload_batch["atom_pad_mask"].detach().cpu()
+    _tmp_mp.undo()
+
+    # Replicate auxiliary tensors across the DP dim so distribute_atom_features
+    # sees ``batch == dp_world_size`` (its asserted invariant).
+    atom_counts_per_token_host = atom_counts_per_token_host.repeat(dp, 1)
+    atom_pad_mask_host = atom_pad_mask_host.repeat(dp, 1)
+
+    # --- Pre-generate deterministic noise (masked by atom_pad_mask) ---
+    # Replicate one B*multiplicity noise tensor across the DP dim so every DP
+    # rank sees bit-identical noise; otherwise DP-averaged grads drift from
+    # serial single-sample grads in FP32 (~5e-3 rel on grad_norm).
+    seed_by_rank(0, seed=seed)
+    sigmas_global = pretrained_model.structure_module.noise_distribution(B * multiplicity).to(dtype=dtype).repeat(dp)
+    noise_global = torch.empty(B * multiplicity, max_atoms, 3, dtype=dtype)
+    init_tensors_uniform([noise_global], low=-scale_glorot, high=scale_glorot)
+    noise_global = noise_global.repeat(dp, 1, 1)
+    _mask_mul = atom_pad_mask_host[:, :, None].repeat_interleave(multiplicity, 0).to(dtype=dtype)
+    noise_global = noise_global * _mask_mul
+
+    sigmas_global_host = sigmas_global.detach().cpu()
+    noise_global_host = noise_global.detach().cpu()
+
+    # Deterministic R, tr replayed by both serial and dist patches in the
+    # diffusion sampler — identical across all DP ranks.
+    seed_by_rank(0, seed=seed + 1)
+    R_fixed_host = random_rotations(multiplicity, dtype=dtype, device=torch.device("cpu"))
+    tr_fixed_host = torch.randn((multiplicity, 1, 3), dtype=dtype) * scale_glorot
+
+    # --- Write serial config ---
+    serial_output_dir = tmp_path / "serial_output"
+    serial_output_dir.mkdir(parents=True, exist_ok=True)
+    serial_config_path = tmp_path / "serial_config.yaml"
+    _conf_ds_overrides = {
+        "filters": None,
+        "moldir": None,
+        "symmetry_correction": False,
+        "val_group": "RCSB",
+        "use_train_subset": None,
+        "override_bfactor": False,
+        "override_method": None,
+    }
+    _write_train_config(
+        TrainTestConfig(
+            config_path=serial_config_path,
+            output_dir=serial_output_dir,
+            test_data_dir=training_data_dir,
+            mol_dir=canonical_mols_dir,
+            mode="serial",
+            accelerator="gpu",
+            limit_train_batches=1,
+            pretrained=str(pretrained_path),
+            model=_confidence_model_dict(multiplicity=multiplicity),
+            batch_size=B,
+            samples_per_epoch=B,
+            max_tokens=max_tokens,
+            max_atoms=max_atoms,
+            max_seqs=max_seqs,
+            return_train_symmetries=False,
+            split=str(split_file),
+            pop_target_keys=True,
+            extra_dataset_overrides=_conf_ds_overrides,
+            v2=True,
+            compute_frames=True,
+            strict_loading=False,
+            wandb=None,
+            save_top_k=0,
+            disable_checkpoint=False,
+        )
+    )
+
+    # --- Apply serial monkeypatches ---
+    serial_mp = pytest.MonkeyPatch()
+    _apply_cached_getitem(serial_mp, cached_samples_path)
+
+    _orig_serial_boltz2_init = SerialBoltz2.__init__
+
+    @functools.wraps(_orig_serial_boltz2_init)
+    def _init_with_confidence_validators(self, *args, **kwargs):
+        if kwargs.get("validate_structure", False) and not kwargs.get("validators"):
+            kwargs["validators"] = [
+                RCSBValidator(val_names=["RCSB"], confidence_prediction=True, physicalism_metrics=False)
+            ]
+        _orig_serial_boltz2_init(self, *args, **kwargs)
+
+    serial_mp.setattr(SerialBoltz2, "__init__", _init_with_confidence_validators)
+
+    serial_mp.setattr(
+        SerialAtomDiffusionV2,
+        "noise_distribution",
+        lambda self, bs: sigmas_global[:bs].to(device=self.zero.device),
+    )
+
+    _serial_in_val = [False]
+
+    def _serial_randn_like(t):
+        if _serial_in_val[0]:
+            return torch.zeros_like(t)
+        return noise_global[: t.shape[0], : t.shape[1]].to(device=t.device, dtype=t.dtype)
+
+    serial_mp.setattr(serial_diffusion_v2_module.torch, "randn_like", _serial_randn_like)
+
+    _orig_serial_randn = serial_diffusion_v2_module.torch.randn
+
+    def _serial_randn(*args, **kwargs):
+        if _serial_in_val[0]:
+            kwargs.pop("generator", None)
+            return torch.zeros(*args, **kwargs)
+        # Replay ``noise_global`` for the diffusion-sampler init/eps calls so
+        # serial and distributed start from the same trajectory.
+        shape = tuple(args[0]) if len(args) == 1 and isinstance(args[0], (tuple, list, torch.Size)) else tuple(args)
+        is_atom_coords_shape = (
+            len(shape) == 3
+            and shape[2] == 3
+            and shape[0] <= noise_global.shape[0]
+            and shape[1] <= noise_global.shape[1]
+        )
+        if not is_atom_coords_shape:
+            return _orig_serial_randn(*args, **kwargs)
+        device = kwargs.get("device", torch.device("cpu"))
+        out_dtype = kwargs.get("dtype", noise_global.dtype)
+        return noise_global[: shape[0], : shape[1]].to(device=device, dtype=out_dtype)
+
+    serial_mp.setattr(serial_diffusion_v2_module.torch, "randn", _serial_randn)
+
+    def _shared_augmentation(multiplicity, s_trans=1.0, device=None, dtype=torch.float32):
+        # Return the same R, tr that the dist patches feed into the dist sampler.
+        # Both serial and distributed now exercise the rotation+translation code
+        # path with a deterministic, identical augmentation per step.
+        R = R_fixed_host[:multiplicity].to(device=device, dtype=dtype)
+        tr = (tr_fixed_host[:multiplicity] * s_trans).to(device=device, dtype=dtype)
+        return R, tr
+
+    serial_mp.setattr(serial_diffusion_v2_module, "compute_random_augmentation", _shared_augmentation)
+
+    _orig_serial_val_step = SerialBoltz2.validation_step
+
+    def _serial_val_step_wrapper(self_model, batch, batch_idx):
+        _serial_in_val[0] = True
+        try:
+            return _orig_serial_val_step(self_model, batch, batch_idx)
+        finally:
+            _serial_in_val[0] = False
+
+    serial_mp.setattr(SerialBoltz2, "validation_step", _serial_val_step_wrapper)
+
+    serial_captured_metrics: dict[str, float] = {}
+    _orig_fit = pl.Trainer.fit
+
+    def _serial_capturing_fit(self, *args, **kwargs):
+        result = _orig_fit(self, *args, **kwargs)
+        for k, v in self.callback_metrics.items():
+            if isinstance(v, torch.Tensor):
+                serial_captured_metrics[k] = v.detach().cpu().item()
+            else:
+                serial_captured_metrics[k] = v
+        return result
+
+    serial_mp.setattr(pl.Trainer, "fit", _serial_capturing_fit)
+
+    # --- Run serial training ---
+    _serial_train_mod = _load_serial_train_module()
+    _serial_train_mod.train(str(serial_config_path), [])
+
+    # --- Find serial checkpoint ---
+    serial_ckpt_files = list(serial_output_dir.rglob("last.ckpt"))
+    assert (
+        len(serial_ckpt_files) == 1
+    ), f"Expected exactly 1 last.ckpt in serial output, found {len(serial_ckpt_files)}: {serial_ckpt_files}"
+    serial_ckpt_path = serial_ckpt_files[0]
+
+    # Verify serial checkpoint has EMA
+    serial_ckpt = torch.load(serial_ckpt_path, map_location="cpu", weights_only=False)
+    assert "ema" in serial_ckpt, "Serial checkpoint missing EMA state"
+    assert "ema_weights" in serial_ckpt["ema"], "Serial EMA missing ema_weights"
+
+    # Non-vacuous guard: serial must have logged confidence loss and at least one LDDT val metric
+    assert "train/confidence_loss" in serial_captured_metrics, (
+        f"Serial run produced no train/confidence_loss — test is vacuous. "
+        f"Available metrics: {sorted(serial_captured_metrics)}"
+    )
+    assert (
+        serial_captured_metrics["train/confidence_loss"] > 0
+    ), f"Serial train/confidence_loss={serial_captured_metrics['train/confidence_loss']:.6f} — should be > 0"
+    serial_lddt_keys = [
+        k for k in serial_captured_metrics if k.startswith("val/lddt_") or k.startswith("val/disto_lddt_")
+    ]
+    assert serial_lddt_keys, (
+        f"Serial run produced no validation LDDT metrics — test is vacuous. "
+        f"Available metrics: {sorted(serial_captured_metrics)}"
+    )
+
+    serial_mp.undo()
+
+    # --- Write distributed config ---
+    dp = grid_group_sizes["dp"]
+    cp0, cp1 = grid_group_sizes["cp"]
+    size_cp = cp0 * cp1
+    dist_output_dir = tmp_path / "dist_output"
+    dist_output_dir.mkdir(parents=True, exist_ok=True)
+    dist_config_path = tmp_path / "dist_config.yaml"
+    _write_train_config(
+        TrainTestConfig(
+            config_path=dist_config_path,
+            output_dir=dist_output_dir,
+            test_data_dir=training_data_dir,
+            mol_dir=canonical_mols_dir,
+            size_dp=dp,
+            size_cp=size_cp,
+            accelerator="gpu",
+            limit_train_batches=1,
+            pretrained=str(pretrained_path),
+            model=_confidence_model_dict(multiplicity=multiplicity, distributed=True),
+            # Dist runtime requires ``batch_size == DP world size``; the cached
+            # getitem serves the same B sample across all DP ranks, so the
+            # DP-averaged gradient still matches the serial single-sample one.
+            batch_size=dp,
+            samples_per_epoch=dp,
+            max_tokens=max_tokens,
+            max_atoms=max_atoms,
+            max_seqs=max_seqs,
+            return_train_symmetries=False,
+            split=str(split_file),
+            pop_target_keys=True,
+            extra_dataset_overrides=_conf_ds_overrides,
+            compute_frames=True,
+        )
+    )
+
+    # --- Spawn distributed workers ---
+    spawn_multiprocessing(
+        _worker_e2e_confidence_training_parity,
+        world_size,
+        grid_group_sizes,
+        device_type,
+        backend,
+        env_per_rank,
+        str(dist_config_path),
+        str(dist_output_dir),
+        str(serial_ckpt_path),
+        str(pretrained_path),
+        serial_captured_metrics,
+        sigmas_global_host,
+        noise_global_host,
+        atom_counts_per_token_host,
+        str(cached_samples_path),
+        seed,
+        R_fixed_host,
+        tr_fixed_host,
+    )
+
+
+# ---------------------------------------------------------------------------
+#  4D true_coords squeeze guard unit test
+# ---------------------------------------------------------------------------
+
+
+def _worker_confidence_4d_true_coords_squeeze(
+    rank: int,
+    grid_group_sizes: dict,
+    device_type: str,
+    backend: str,
+    env_per_rank: dict[str, Any],
+) -> None:
+    """Multi-rank worker: verify the 4D→3D squeeze guard in _compute_confidence_loss.
+
+    ``get_true_coordinates`` with ``symmetry_correction=True`` calls
+    ``shardwise_unsqueeze(true_coords, dim=1)``, producing a 4D DTensor
+    shaped ``(B*mult, 1, N, 3)``.  ``_compute_confidence_loss`` must
+    detect this and squeeze back to 3D before calling ``confidence_loss``.
+    This test directly exercises that path (boltz2.py:830).
+    """
+    from boltz.distributed.model.layers.squeeze import shardwise_squeeze, shardwise_unsqueeze
+    from boltz.distributed.utils import update_exhaustive_strides
+
+    monkeypatch = pytest.MonkeyPatch()
+    if env_per_rank is not None:
+        for var_name, value in env_per_rank.items():
+            monkeypatch.setenv(var_name, f"{rank}" if value == "<INPUT_RANK>" else value)
+
+    DistributedManager.initialize(grid_group_sizes, device_type=device_type, backend=backend)
+    manager = DistributedManager()
+    device_mesh = manager.device_mesh_subgroups
+    device = manager.device
+
+    dtype = torch.float32
+    B_mult = device_mesh.size(0) * device_mesh.size(1) * device_mesh.size(2)
+    N = 16  # token/atom count — must be divisible by cp dims
+
+    # Create 3D true_coords (B*mult, N, 3) sharded along dim 0
+    tc_3d_local = torch.randn(B_mult // device_mesh.size(0), N, 3, device=device, dtype=dtype)
+    tc_3d_global_shape = torch.Size([B_mult, N, 3])
+
+    tc_3d = DTensor.from_local(
+        tc_3d_local,
+        device_mesh=device_mesh,
+        placements=(Shard(0), Replicate(), Replicate()),
+        shape=tc_3d_global_shape,
+        stride=update_exhaustive_strides(tc_3d_local.shape, tc_3d_local.stride(), tc_3d_global_shape),
+    )
+
+    # Simulate get_true_coordinates(symmetry_correction=True): inserts dim 1
+    tc_4d = shardwise_unsqueeze(tc_3d, dim=1)  # (B*mult, 1, N, 3)
+    assert tc_4d.ndim == 4, f"Rank {rank}: expected 4D after unsqueeze, got {tc_4d.ndim}"
+
+    # Apply the guard from _compute_confidence_loss (boltz2.py:830)
+    if tc_4d.ndim == 4:
+        tc_squeezed = shardwise_squeeze(tc_4d, dim=1)
+    else:
+        tc_squeezed = tc_4d
+
+    # Verify shape is back to 3D
+    assert tc_squeezed.ndim == 3, f"Rank {rank}: expected 3D after squeeze, got {tc_squeezed.ndim}"
+    assert (
+        tc_squeezed.shape == tc_3d.shape
+    ), f"Rank {rank}: shape mismatch after round-trip: got {tc_squeezed.shape}, expected {tc_3d.shape}"
+
+    # Values must be preserved by the unsqueeze→squeeze round-trip
+    torch.testing.assert_close(
+        tc_squeezed.full_tensor(),
+        tc_3d.full_tensor(),
+        msg=lambda m: f"Rank {rank}: value mismatch after 4D→3D squeeze: {m}",
+    )
+
+    # Guard must not fire on 3D input (the symmetry_correction=False path)
+    if tc_3d.ndim == 4:
+        tc_3d_squeezed = shardwise_squeeze(tc_3d, dim=1)
+    else:
+        tc_3d_squeezed = tc_3d
+    assert tc_3d_squeezed is tc_3d, f"Rank {rank}: guard incorrectly fired on 3D input"
+
+    torch.distributed.barrier()
+    DistributedManager.cleanup()
+    monkeypatch.undo()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "setup_env",
+    [
+        ((1, (1, 1)), True, "cuda", "ENV"),
+    ],
+    indirect=("setup_env",),
+    ids=["cuda-dp1-cp1x1"],
+)
+def test_boltz2_confidence_4d_true_coords_squeeze(setup_env):
+    """Dedicated test for the 4D→3D squeeze guard in ``_compute_confidence_loss``.
+
+    ``get_true_coordinates`` with ``symmetry_correction=True`` calls
+    ``shardwise_unsqueeze(true_coords, dim=1)`` producing a 4D DTensor
+    ``(B*mult, 1, N, 3)``.  ``_compute_confidence_loss`` at boltz2.py:830
+    must detect ``ndim == 4`` and squeeze back to 3D before calling
+    ``confidence_loss``.
+
+    This test directly exercises that round-trip: unsqueeze → guard → squeeze,
+    verifying shape and value preservation across ranks.
+    """
+    grid_group_sizes, world_size, device_type, backend, _, env_per_rank = setup_env
+
+    if device_type == "cuda":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        if torch.cuda.device_count() < world_size:
+            pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+
+    spawn_multiprocessing(
+        _worker_confidence_4d_true_coords_squeeze,
+        world_size,
+        grid_group_sizes,
+        device_type,
+        backend,
+        env_per_rank,
     )
 
 
@@ -2525,14 +3420,12 @@ def _worker_bf16_dtype_parity(
 
     # --- Non-vacuous: autocast must produce a mix of BF16 and FP32 ---
     dist_fwd_dtypes_set = set(dist_fwd.values())
-    assert torch.bfloat16 in dist_fwd_dtypes_set, (
-        f"Rank {rank}: no bfloat16 activations found — autocast may not be active. "
-        f"Unique dtypes: {dist_fwd_dtypes_set}"
-    )
-    assert torch.float32 in dist_fwd_dtypes_set, (
-        f"Rank {rank}: no float32 activations found — all ops appear autocasted. "
-        f"Unique dtypes: {dist_fwd_dtypes_set}"
-    )
+    assert (
+        torch.bfloat16 in dist_fwd_dtypes_set
+    ), f"Rank {rank}: no bfloat16 activations found — autocast may not be active. Unique dtypes: {dist_fwd_dtypes_set}"
+    assert (
+        torch.float32 in dist_fwd_dtypes_set
+    ), f"Rank {rank}: no float32 activations found — all ops appear autocasted. Unique dtypes: {dist_fwd_dtypes_set}"
 
     # --- Parameter gradient dtypes: strict equality at common param names ---
     common_grads = sorted(set(serial_grads) & set(dist_grads))
@@ -2598,9 +3491,9 @@ def test_boltz2_bf16_dtype_parity(
 
     # Non-vacuous: serial must have a mix of BF16 and FP32 activations
     serial_fwd_dtypes_set = set(profiler.fwd_dtypes.values())
-    assert torch.bfloat16 in serial_fwd_dtypes_set, (
-        f"Serial: no bfloat16 activations — autocast may not be active. " f"Unique dtypes: {serial_fwd_dtypes_set}"
-    )
+    assert (
+        torch.bfloat16 in serial_fwd_dtypes_set
+    ), f"Serial: no bfloat16 activations — autocast may not be active. Unique dtypes: {serial_fwd_dtypes_set}"
     assert (
         torch.float32 in serial_fwd_dtypes_set
     ), f"Serial: no float32 activations. Unique dtypes: {serial_fwd_dtypes_set}"
@@ -2768,10 +3661,9 @@ def test_boltz_actv_ckpt_parity(
         f"Serial: only {len(serial_recomp)} modules recomputed (expected >= 5). "
         f"Activation checkpointing may not be active."
     )
-    assert serial_recomp < all_serial_names, (
-        f"Serial: all {len(all_serial_names)} modules are recomputed — "
-        f"not a strict subset, implying a counting bug."
-    )
+    assert (
+        serial_recomp < all_serial_names
+    ), f"Serial: all {len(all_serial_names)} modules are recomputed — not a strict subset, implying a counting bug."
 
     # Save serial recompute profile for workers
     serial_recompute_profile_path = tmp_path / "serial_recompute_profile.pt"
