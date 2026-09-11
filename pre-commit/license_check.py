@@ -326,9 +326,9 @@ def entrypoint(  # noqa: PLR0915, PLR0912, C901
             p = Path(f).absolute()
             if p.name.endswith(".py"):
                 py_staged.append(f)
-        # always also license-check the bundled fold-cp Claude Code plugin (extend coverage to plugins/)
-        check = tuple(f for f in py_staged) + ("plugins/fold-cp",)
-        logger.info(f"Run license_check.py on the staged files + plugins/fold-cp: {check}")  # noqa: G004
+        # Always include Fold-CP skill helpers and the optional plugin hooks.
+        check = tuple(f for f in py_staged) + ("skills", "hooks")
+        logger.info(f"Run license_check.py on the staged files + skills and hooks: {check}")  # noqa: G004
 
     if replace and not modify:
         raise ValueError("Must use --modify if also using --replace !")  # noqa: TRY003, EM101

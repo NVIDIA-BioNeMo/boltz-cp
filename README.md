@@ -83,15 +83,19 @@ CLI overrides, and differences from serial training, see the
 
 The sections above run context parallelism on the **demonstrated Boltz model**. If
 you want to add the same DTensor-based CP to **your own** co-folding /
-structure-prediction model, this repository also ships **fold-cp**, an agentic plugin
-that guides the integration end to end and uses this repository's CP code as its
-reference implementation. It works with **both** [Claude Code](https://code.claude.com)
+structure-prediction model, this repository also ships **fold-cp**, a collection of
+agent skills in [`skills/`](skills/) that guides the integration end to end and uses
+this repository's CP code as its reference implementation. It works with **both**
+[Claude Code](https://code.claude.com)
 and the [OpenAI Codex CLI](https://developers.openai.com/codex) — the same skills, hard
-rules, and CP guide ship for both runtimes.
+rules, and CP guide ship for both runtimes. nvSkills validates each
+`skills/<name>/SKILL.md` separately. The optional plugin manifests at the repository
+root package these same skills with session hooks; no `plugins/` content folder is
+required. See the [skill catalog](docs/fold_cp_skills.md).
 
-fold-cp is project/model-agnostic. It contributes a set of CP **hard-rules** (injected
-every session via a SessionStart hook, plus an opt-in guard that protects your serial
-ground-truth files), **11 skills** that cover the integration from exploration through
+fold-cp is project/model-agnostic. It contributes a set of CP **hard-rules** (loaded
+by each skill, or via a SessionStart hook with the optional plugin and its opt-in
+guard for serial ground-truth files), **11 skills** that cover integration from exploration through
 profiling, and a bundled high-level **CP technical guide**. A top-level *conductor*
 skill sequences and gates the whole effort and delegates each phase to the focused
 skills; you can also invoke any skill on its own. Once the plugin is installed and
@@ -153,19 +157,19 @@ under `[plugins."fold-cp@boltz-cp"]` in `config.toml`.)
 
 ### Step 2 — Drive the whole integration with the conductor
 
-`cpize_model_workflow` is the top-level entry point. It maps your model, verifies
+`cpize-model-workflow` is the top-level entry point. It maps your model, verifies
 infrastructure, shards the data features, ports the DTensor modules, proves
 serial-vs-CP numerical parity, wires the trainer/predictor lifecycle, and
 profiles/benchmarks — phase by phase, gating on each.
 
 ```
-/fold-cp:cpize_model_workflow training trunk dp:1 cp:(2,2) model:~/code/myfold ref:~/code/boltz-cp --local --random --automatic
+/fold-cp:cpize-model-workflow training trunk dp:1 cp:(2,2) model:~/code/myfold ref:~/code/boltz-cp --local --random --automatic
 ```
 
 In **Codex**, invoke the same conductor with the `$` prefix and identical arguments:
 
 ```
-$cpize_model_workflow training trunk dp:1 cp:(2,2) model:~/code/myfold ref:~/code/boltz-cp --local --random --automatic
+$cpize-model-workflow training trunk dp:1 cp:(2,2) model:~/code/myfold ref:~/code/boltz-cp --local --random --automatic
 ```
 
 Arguments are parsed **by keyword and are order-independent**; every one is optional and
@@ -175,7 +179,7 @@ has a default:
 |---|---|---|
 | `training` | **scope** | which workflow to CP-ify: `inference` / `training` / `all` (default `all`). |
 | `trunk` | **focus** | subsystem to integrate **first** — an ordering seed, not a filter (the whole model stays in scope). e.g. `trunk` / `diffusion` / `confidence` / `data`. Absent ⇒ data pipeline first. |
-| `dp:1 cp:(2,2)` | **mesh** | device mesh used for every parity test, benchmark, and profile: `dp` data-parallel replicas × a `cp0×cp1` CP grid. `cp:(2,2)` ⇒ 2D-CP, `world_size = 4`. Absent ⇒ chosen by `build_infra`. |
+| `dp:1 cp:(2,2)` | **mesh** | device mesh used for every parity test, benchmark, and profile: `dp` data-parallel replicas × a `cp0×cp1` CP grid. `cp:(2,2)` ⇒ 2D-CP, `world_size = 4`. Absent ⇒ chosen by `build-infra`. |
 | `model:~/code/myfold` | **model path** | your serial model code to CP-ify. Absent ⇒ resolved by tracing. |
 | `ref:~/code/boltz-cp` | **reference repo** | the CP reference implementation every mapping cites (this repo). Absent ⇒ `$BOLTZ_CP_REPO` env var / filesystem search. |
 | `--local` | **launch env** | run multi-rank jobs on local GPUs; `--slurm` uses a cluster. |
@@ -191,7 +195,7 @@ missing reference repo). Because automatic is the default, **`--automatic` is op
 the minimal run below behaves identically whether or not you pass it:
 
 ```
-/fold-cp:cpize_model_workflow model:~/code/myfold ref:~/code/boltz-cp --automatic
+/fold-cp:cpize-model-workflow model:~/code/myfold ref:~/code/boltz-cp --automatic
 ```
 
 ### Step 3 — Or run individual skills
@@ -200,55 +204,55 @@ The conductor invokes the skills below; you can also run any of them directly. E
 called as **`/fold-cp:<skill> <args>`** in Claude Code or **`$<skill> <args>`** in Codex
 (same arguments either way, optional and order-tolerant).
 
-- **`learn_context`** — explore your model and map it onto the CP reference.
+- **`learn-context`** — explore your model and map it onto the CP reference.
   `[scope: inference|training|data|all] [path to model code]`
   ```
-  /fold-cp:learn_context all ~/code/myfold
+  /fold-cp:learn-context all ~/code/myfold
   ```
-- **`build_infra`** — probe GPUs / software stack and run distributed smoke tests.
+- **`build-infra`** — probe GPUs / software stack and run distributed smoke tests.
   `[--local | --slurm] [requested world size]`
   ```
-  /fold-cp:build_infra --local 4
+  /fold-cp:build-infra --local 4
   ```
-- **`shard_data_feats`** — assign DTensor placements and shard the data features.
+- **`shard-data-feats`** — assign DTensor placements and shard the data features.
   `[2d] [feature group: atom|token|msa|pair|all]`
   ```
-  /fold-cp:shard_data_feats 2d all
+  /fold-cp:shard-data-feats 2d all
   ```
-- **`dtensor_modules`** — port a serial layer/module to a DTensor CP module.
+- **`dtensor-modules`** — port a serial layer/module to a DTensor CP module.
   `[module name] [2d]`
   ```
-  /fold-cp:dtensor_modules TriangleMultiplication 2d
+  /fold-cp:dtensor-modules TriangleMultiplication 2d
   ```
 - **`test`** — write/run multi-rank parity tests (CP vs serial ground truth).
   `[source file under test] [unit|layer|module|workflow] [2d]`
   ```
   /fold-cp:test src/boltz/distributed/model/trimul_cp.py module 2d
   ```
-- **`dist_lifecycle`** — wire the distributed training/inference lifecycle.
+- **`dist-lifecycle`** — wire the distributed training/inference lifecycle.
   `[wrap | checkpoint | resume | ema | optimizer]`
   ```
-  /fold-cp:dist_lifecycle checkpoint
+  /fold-cp:dist-lifecycle checkpoint
   ```
-- **`dispatch_work`** — orchestrate a coder+reviewer agent team to port many modules in
+- **`dispatch-work`** — orchestrate a coder+reviewer agent team to port many modules in
   parallel. `[module/test scope, or 'all new modules in current_code_structure.md']`
   ```
-  /fold-cp:dispatch_work all new modules in current_code_structure.md
+  /fold-cp:dispatch-work all new modules in current_code_structure.md
   ```
 - **`benchmark`** — find the max token count at a CP size and record walltime.
   `[inference | training] [data path | --random] [cp size]`
   ```
   /fold-cp:benchmark inference --random 4
   ```
-- **`nsys_profile`** — profile with NVIDIA Nsight Systems.
+- **`nsys-profile`** — profile with NVIDIA Nsight Systems.
   `[e2e | trunk] [N_token] [cp size]`
   ```
-  /fold-cp:nsys_profile e2e 512 4
+  /fold-cp:nsys-profile e2e 512 4
   ```
-- **`mem_profile`** — attribute the top-N memory peaks to modules/lines via the PyTorch
+- **`mem-profile`** — attribute the top-N memory peaks to modules/lines via the PyTorch
   allocator history. `[e2e | trunk] [N_token] [cp size]`
   ```
-  /fold-cp:mem_profile trunk 768 4
+  /fold-cp:mem-profile trunk 768 4
   ```
 
 ## Contributing
