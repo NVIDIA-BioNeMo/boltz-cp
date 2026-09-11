@@ -1173,7 +1173,7 @@ def test_boltz2_run_predict_auto_pad_for_sm100f(
 # ---------------------------------------------------------------------------
 # RNG entropy rule: single-device RNG *entropy* equivalence under CP.
 #
-# Rule (fold-cp hooks/RULES.md): a distributed random draw must match the
+# Rule (skills/learn-context/references/RULES.md): a distributed random draw must match the
 # *entropy structure* of the single-device reference -- which axes carry
 # independent vs shared randomness -- not the numeric values (a distributed RNG
 # that numerically reproduces an all-gathered single-device draw does not exist
