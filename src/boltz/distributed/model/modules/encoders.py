@@ -1233,8 +1233,22 @@ class AtomAttentionEncoder(Module):
             atom_to_token_ids_global_mul = shardwise_repeat_interleave(atom_to_token_ids_global, multiplicity, 0)
             atom_mask_bool_mul = shardwise_repeat_interleave(atom_mask_bool, multiplicity, 0)
 
-            # n_tokens_per_shard from atom_to_token_local_onehot (see plan notes)
-            n_tokens_per_shard = feats["atom_to_token_local_onehot"].to_local().shape[2]
+            # Compute n_tokens_per_shard: the number of token output slots per
+            # CP rank for the scatter_reduce.  For 2D CP (3D mesh: dp, cp0,
+            # cp1) the featurizer constructs a block-diagonal one-hot whose
+            # local dim-2 already equals N_tokens / cp0 (per-shard count).
+            # For 1D CP (2D mesh: dp, cp) the one-hot spans ALL tokens, so
+            # local dim-2 equals N_tokens_global and must be divided by
+            # cp_size.
+            a2t = feats["atom_to_token_local_onehot"]
+            n_tokens_local_dim2 = a2t.to_local().shape[2]
+            if a2t.device_mesh.ndim == 2:
+                # 1D CP: token dim is full (not block-diagonal), divide by cp.
+                cp_size = a2t.device_mesh.size(-1)
+                n_tokens_per_shard = n_tokens_local_dim2 // cp_size
+            else:
+                # 2D CP: token dim is already per-shard by construction.
+                n_tokens_per_shard = n_tokens_local_dim2
 
             # Both serial and distributed now compute exact mean (sum / count).
             # The serial code previously used biased mean: atom_to_token / (count + 1e-6),

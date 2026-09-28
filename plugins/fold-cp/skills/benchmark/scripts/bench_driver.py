@@ -31,10 +31,10 @@ Run ``--adapter demo`` for a synthetic sharded-pair workload that validates the
 harness mechanics without a real model.
 
 Examples:
-    timeout 600 python bench_driver.py --adapter demo --cp 4 \
+    timeout 600 python bench_driver.py --adapter demo --topology 2d --cp 4 \
         --workflow inference --sizes 256,512,1024 --max-token-probe
-    timeout 600 python bench_driver.py --adapter myproj.bench_adapter --cp 4 \
-        --workflow training --sizes 512,1024 --atoms 8192 --msa 128
+    timeout 600 python bench_driver.py --adapter myproj.bench_adapter --topology 1d \
+        --cp 3 --workflow training --sizes 512,1024 --atoms 8192 --msa 128
 
 Walltime per point is the median over repeats of the slowest rank (all_reduce MAX);
 peak memory is the max over ranks. Writes a markdown table + CSV on rank 0.
@@ -46,7 +46,6 @@ import argparse
 import csv
 import datetime
 import importlib
-import math
 import os
 import statistics
 import time
@@ -80,7 +79,8 @@ def _demo_build_batch(N, n_atoms, S, mesh, device):
     c = 64
     gen = torch.Generator(device=device).manual_seed(0)
     z = torch.randn(N, N, c, generator=gen, device=device)
-    return distribute_tensor(z, mesh, [Shard(0), Shard(1)]).requires_grad_(True)
+    placements = [Shard(0), Shard(1)] if mesh.ndim == 2 else [Shard(0)]
+    return distribute_tensor(z, mesh, placements).requires_grad_(True)
 
 
 def _demo_run_step(model, batch, train):
@@ -162,9 +162,12 @@ def worker(rank, world_size, args, port):
     device = torch.device("cuda", rank % torch.cuda.device_count())
     torch.cuda.set_device(device)
 
-    sq = math.isqrt(world_size)
-    assert sq * sq == world_size, "2d benchmark needs a perfect-square world size"
-    mesh = init_device_mesh("cuda", (sq, sq), mesh_dim_names=("cp0", "cp1"))
+    if args.topology == "2d":
+        sq = int(round(world_size**0.5))
+        assert sq * sq == world_size, "2d benchmark needs a perfect-square world size"
+        mesh = init_device_mesh("cuda", (sq, sq), mesh_dim_names=("cp0", "cp1"))
+    else:
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("cp",))
 
     adapter = _load_adapter(args.adapter)
     model = adapter["build_model"](mesh, device)
@@ -214,7 +217,7 @@ def worker(rank, world_size, args, port):
 
 
 def _emit(args, rows, max_fit, world_size):
-    cp = f"2d cp={world_size}"
+    cp = f"{args.topology} cp={world_size}"
     md = [
         f"# CP benchmark — {args.workflow}",
         "",
@@ -242,6 +245,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--adapter", default="demo", help="module path or 'demo'")
     ap.add_argument("--workflow", choices=["inference", "training"], default="inference")
+    ap.add_argument("--topology", choices=["1d", "2d"], default="2d")
     ap.add_argument("--cp", type=int, required=True, help="world size (cp ranks)")
     ap.add_argument("--sizes", default="256,512,1024", help="comma N_tokens sweep")
     ap.add_argument("--atoms", type=int, default=0)
@@ -252,10 +256,6 @@ def main() -> int:
     ap.add_argument("--out", default="docs/cp_benchmark.md")
     ap.add_argument("--port", type=int, default=29560)
     args = ap.parse_args()
-
-    sq = math.isqrt(args.cp)
-    if sq < 2 or sq * sq != args.cp:
-        raise SystemExit("cp must be a perfect square >= 4 for the 2D benchmark")
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < args.cp:
         raise SystemExit(

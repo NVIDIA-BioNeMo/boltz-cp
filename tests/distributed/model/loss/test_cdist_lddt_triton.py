@@ -19,7 +19,6 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -30,6 +29,7 @@ import torch
 from boltz.distributed.model.loss.triton.cdist_lddt import cdist_lddt
 from boltz.model.loss.confidencev2 import lddt_dist
 from boltz.testing.utils import init_tensors_uniform
+from tests.distributed.model.loss.triton_test_utils import get_triton_ptxas_path
 
 
 def lddt_dist_reference(
@@ -390,7 +390,7 @@ def assert_no_register_spilling(path_to_ptx_file: Path):
     sm_arch = sm_arch_match.group(1)
 
     # Run ptxas
-    ptxas_path = os.environ.get("TRITON_PTXAS_PATH", "ptxas")
+    ptxas_path = get_triton_ptxas_path(sm_arch)
 
     cmd = [ptxas_path, "-v", f"--gpu-name={sm_arch}", str(path_to_ptx_file)]
 
@@ -410,8 +410,6 @@ def test_no_register_spilling(tmp_path, monkeypatch):
     monkeypatch.setenv("TRITON_DUMP_DIR", str(tmp_path))
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("TRITON_PTXAS_PATH", os.environ.get("TRITON_PTXAS_PATH", "ptxas"))
-
     device = torch.device("cuda")
     B_mul, B, N = 16, 1, 100
 

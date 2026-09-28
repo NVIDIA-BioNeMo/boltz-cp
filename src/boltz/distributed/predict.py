@@ -53,11 +53,13 @@ from boltz.data import const
 from boltz.data.types import Manifest
 from boltz.data.write.writer import BoltzWriter
 from boltz.distributed.data.module.inferencev2 import Boltz2InferenceDataModuleDTensor
+from boltz.distributed.data.module.inferencev2_1d import Boltz2InferenceDataModuleDTensor1D
 from boltz.distributed.data.types import PairMaskMode
-from boltz.distributed.data.utils import map_subgroup_mesh_to_cpu
+from boltz.distributed.data.utils import map_mesh_to_cpu_1d, map_subgroup_mesh_to_cpu
 from boltz.distributed.manager import DistributedManager
 from boltz.distributed.model.layers.triangular_attention import can_run_cueq_triattn_sm100f
 from boltz.distributed.model.models.boltz2 import Boltz2 as Boltz2Distributed
+from boltz.distributed.model.models.boltz2_1d import Boltz2_1D as Boltz2Distributed1D
 from boltz.distributed.model.modules.utils import (
     PRECISION_TO_LIGHTNING,
     Precision,
@@ -105,6 +107,7 @@ def run_predict(
     checkpoint: str | Path,
     size_dp: int = 1,
     size_cp: int = 1,
+    cp_topology: Literal["1d", "2d"] = "2d",
     accelerator: str = "gpu",
     recycling_steps: int = 3,
     sampling_steps: int = 200,
@@ -153,7 +156,14 @@ def run_predict(
     size_dp : int
         Number of data-parallel ranks.
     size_cp : int
-        Total number of context-parallel ranks (must be a perfect square).
+        Total number of context-parallel ranks.  For ``cp_topology="2d"``
+        this must be a perfect square (used as ``(sqrt, sqrt)``); for
+        ``cp_topology="1d"`` any positive integer is valid.
+    cp_topology : {"1d", "2d"}
+        CP mesh topology — ``"1d"`` wraps the model with :class:`Boltz2_1D`
+        on a flat ``(dp, cp)`` mesh, ``"2d"`` (default) wraps with
+        :class:`Boltz2` on the ``(dp, cp0, cp1)`` subgroup mesh.  Mirrors
+        the dispatch in :func:`boltz.distributed.train.train`.
     accelerator : str
         Device accelerator ("gpu" or "cpu").
     recycling_steps : int
@@ -257,13 +267,22 @@ def run_predict(
     DistributedManager.initialize(device_type=device_type, timeout=timeout_by_device[device_type])
     atexit.register(DistributedManager.cleanup)
     dist_manager = DistributedManager()
+    if not dist_manager.has_dist:
+        raise RuntimeError(
+            "DistributedManager did not initialize torch.distributed. "
+            "Launch this entrypoint under torchrun/slurm with RANK/WORLD_SIZE (or SLURM_* env)."
+        )
 
     if size_dp * size_cp != dist_manager.world_size:
         raise ValueError(f"world_size mismatch: {dist_manager.world_size} != size_dp*size_cp ({size_dp}*{size_cp})")
 
-    size_cp_axis = isqrt(size_cp)
-    if size_cp_axis * size_cp_axis != size_cp:
-        raise ValueError(f"size_cp must be a perfect square, got {size_cp}")
+    if cp_topology not in ("1d", "2d"):
+        raise ValueError(f"cp_topology must be '1d' or '2d', got {cp_topology!r}")
+
+    if cp_topology == "2d":
+        size_cp_axis = isqrt(size_cp)
+        if size_cp_axis * size_cp_axis != size_cp:
+            raise ValueError(f"size_cp must be a perfect square for 2D CP mesh, got {size_cp}")
 
     # Load checkpoint hparams to read existing pairformer_args / msa_args,
     # then ensure the critical V2 flags are set without overriding model
@@ -292,9 +311,10 @@ def run_predict(
             if can_run_cueq_triattn_sm100f(dist_manager.device, torch.bfloat16, 8, dim_hidden, True):
                 sm100f_per_shard_token_multiple = 8
 
-    grid_group_sizes: OrderedDict[str, int | tuple[int, ...]] = OrderedDict(
-        [("dp", size_dp), ("cp", (size_cp_axis, size_cp_axis))]
-    )
+    if cp_topology == "1d":
+        grid_group_sizes: OrderedDict[str, int | tuple[int, ...]] = OrderedDict([("dp", size_dp), ("cp", size_cp)])
+    else:
+        grid_group_sizes = OrderedDict([("dp", size_dp), ("cp", (size_cp_axis, size_cp_axis))])
     DistributedManager.create_grid_group(grid_group_sizes)
 
     DistributedManager.create_group(
@@ -311,7 +331,10 @@ def run_predict(
         use_local_synchronization=True,
         timeout=timeout_by_device["cpu"],
     )
-    device_mesh_cpu = map_subgroup_mesh_to_cpu(dist_manager)
+    if cp_topology == "1d":
+        device_mesh_cpu = map_mesh_to_cpu_1d(dist_manager)
+    else:
+        device_mesh_cpu = map_subgroup_mesh_to_cpu(dist_manager)
 
     # --- Data loading ---
     torch.set_grad_enabled(False)
@@ -402,13 +425,15 @@ def run_predict(
     if dist_manager.group_rank["world"] == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    data_module = Boltz2InferenceDataModuleDTensor(
+    data_module_cls = Boltz2InferenceDataModuleDTensor1D if cp_topology == "1d" else Boltz2InferenceDataModuleDTensor
+    data_module_mesh = dist_manager.device_mesh if cp_topology == "1d" else dist_manager.device_mesh_subgroups
+    data_module = data_module_cls(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
         msa_dir=processed.msa_dir,
         mol_dir=mol_dir,
         num_workers=0,
-        device_mesh=dist_manager.device_mesh_subgroups,
+        device_mesh=data_module_mesh,
         device_mesh_cpu=device_mesh_cpu,
         constraints_dir=None,
         template_dir=processed.template_dir,
@@ -451,7 +476,23 @@ def run_predict(
             ema=False,
         )
     model_serial.eval()
-    model_distributed = Boltz2Distributed(model_serial, dist_manager).eval()
+    if cp_topology == "1d":
+        # TODO(confidence-1d-parity): 1D CP confidence pairformer diverges at cp>1
+        # (plddt ~0.52 vs serial ~0.96). Structure prediction is correct.
+        # Confidence golden values won't match serial until this is resolved.
+        if confidence_prediction and size_cp > 1:
+            warnings.warn(
+                "1D CP confidence at cp>1 is known to diverge from serial: the "
+                "confidence pairformer's layer 4 produces near-random plddt logits "
+                "(argmax ~24 vs serial ~48). Layers 0-3 and the trunk pairformer "
+                "are correct; structure prediction is unaffected. See "
+                "confidence_1d.py:1668 TODO. Recommendation: block confidence on "
+                "1D-CP cp>1 until parity is restored.",
+                stacklevel=2,
+            )
+        model_distributed = Boltz2Distributed1D(model_serial, dist_manager=dist_manager).eval()
+    else:
+        model_distributed = Boltz2Distributed(model_serial, dist_manager).eval()
     model_distributed.apply(SetTriAttnBackend(triattn_backend))
     model_distributed.apply(SetAttnPairBiasBackend(sdpa_with_bias_backend))
     model_distributed.apply(SetAttnPairBiasShardwiseBackend(sdpa_with_bias_shardwise_backend))

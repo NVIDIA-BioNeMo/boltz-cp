@@ -28,12 +28,13 @@ import pytest
 import torch
 
 from boltz.distributed.manager import DistributedManager
+from boltz.distributed.port_utils import find_free_port
 
 
 def test_manager_singleton(monkeypatch):
     # Test distributed manager singleton functions as expected
     monkeypatch.setenv("MASTER_ADDR", "localhost")
-    monkeypatch.setenv("MASTER_PORT", "45678")
+    monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
     monkeypatch.setenv("RANK", "0")
     monkeypatch.setenv("WORLD_SIZE", "1")
     DistributedManager.initialize({"dp": 1, "cp": 1}, "cpu", "gloo")

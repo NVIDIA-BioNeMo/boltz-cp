@@ -27,6 +27,7 @@ from warnings import warn
 
 import torch
 
+from boltz.distributed.port_utils import find_free_port
 from boltz.distributed.utils import LayoutMap, LayoutRightMap
 
 # grid_group_sizes objects must have
@@ -259,7 +260,7 @@ class DistributedManager:
         world_size: int = -1,
         local_rank: Optional[int] = None,
         addr: str = "localhost",
-        port: str = "29500",
+        port: Optional[str] = None,
         method_init: str = "ENV",
         **kwargs_init_pg,
     ):
@@ -331,7 +332,12 @@ class DistributedManager:
         elif backend != backend_for_device[device_type]:
             raise RuntimeError(f"Invalid input backend {backend} for input device type {device_type}")
 
-        # set these in order to call torch.distributed.init_process_group
+        # set these in order to call torch.distributed.init_process_group.
+        # If no port was supplied, allocate a free one from the OS so that
+        # concurrent runs (e.g. parallel pytest worktrees) do not collide on
+        # a hard-coded default. Explicit MASTER_PORT (caller / env) is honored.
+        if port is None:
+            port = find_free_port()
         os.environ["MASTER_ADDR"] = addr
         os.environ["MASTER_PORT"] = str(port)
 
@@ -799,6 +805,10 @@ class DistributedManager:
             world_size=world_size,
             local_rank=local_rank,
             addr=addr,
+            # SLURM job scripts conventionally export MASTER_PORT. Honor it so
+            # every rank picks the same port; without this, each rank would
+            # independently call find_free_port() and disagree.
+            port=os.environ.get("MASTER_PORT"),
             method_init="SLURM",
             **kwargs,
         )

@@ -151,7 +151,7 @@ tests, obey these even if the local project has no `CLAUDE.md` of its own.
     catch (the math is right after the down-cast) yet inflates peak memory — keep
     intermediates in the intended dtype and verify peak with `/fold-cp:mem_profile`.
 11. **Backward memory must match the forward per-rank budget.** Single/token
-    O(N/cp0), pair O(N²/(cp0·cp1)) for 2D. A saved-for-backward
+    O(N/cp), pair O(N²/cp) for 1D or O(N²/(cp0·cp1)) for 2D. A saved-for-backward
     tensor that scales with full N or S is a critical bug. Activation/gradient
     checkpointing is **not** a free ceiling reduction — it trades stored activations for
     a **transient recompute peak** that becomes the new maximum; budget and profile the
@@ -166,10 +166,9 @@ tests, obey these even if the local project has no `CLAUDE.md` of its own.
     test compares the CP path against the serial reference on identical inputs and
     weights.
 14. **No vacuous tests.** Use explicit random `grad_output` — never
-    `.sum().backward()`. Assert sharding is active **when either 2D mesh axis has size > 1**
-    (local shape < global on sharded dims; `(cp0, cp1)=(1,1)` is a valid debugging mesh
-    where local == global, so skip the check there), replicated values are identical
-    across ranks, and gradients are
+    `.sum().backward()`. Assert sharding is active **when `cp_size > 1`** (local shape <
+    global on sharded dims; `cp=1` is a valid debugging mesh where local == global, so skip
+    the check there), replicated values are identical across ranks, and gradients are
     non-zero. **Perturb/randomize zero-initialized parameters before testing** — AF/
     residual-style "final" projections are zero-init, so the output and *all* grads
     are vacuously zero and parity passes as `0 == 0`. **Check per-PARAMETER gradient
@@ -301,6 +300,26 @@ tests, obey these even if the local project has no `CLAUDE.md` of its own.
     up front and the items are independent, prefer a **deterministic pipeline** over many
     separate dispatch round-trips. Same work, same gates — fewer serial wake-ups of the
     (large, re-read-every-turn) orchestrator context.
+
+## Topology safety (1D-CP is experimental)
+
+25. **1D-CP is EXPERIMENTAL — warn and get an explicit at-own-risk sign-off before integrating it.**
+    2D-CP (`cp:(a,b)`, a perfect-square `cp0=cp1` mesh) is the supported, default topology. 1D-CP
+    (a scalar `cp:<n>` / `cp_topology="1d"` / a flat `(cp,)` mesh) has **known pending bugs and
+    unestablished correctness** — in-repo unit parity may pass, but full inference-set parity and
+    training-curve parity are **not** established, and some paths are gated/disabled at `cp>1`
+    (e.g. confidence). Whenever a fold-cp skill resolves the topology to 1D — because the user asked
+    (`cp:<n>` / `1d`) **or** because the hardware forces it (e.g. <4 GPUs, or any non-square mesh) —
+    it must, **once, before any 1D integration / test / benchmark work**:
+    (a) **warn** plainly that 1D is experimental, with pending bugs and unestablished parity;
+    (b) **pause for an explicit `AskUserQuestion`** offering *proceed with 1D at my own risk* /
+    *switch to 2D (recommended — needs a perfect-square mesh)* / *abort*; and
+    (c) **record the acknowledgement** in the relevant doc/ledger (`cp_infra.md`,
+    `current_code_structure.md` §0, or `cp_integration_plan.md`).
+    This one-time risk sign-off is **required even in `--automatic` mode** — it is a front-door safety
+    gate, not a per-wave pause; once acknowledged, proceed without re-asking. If the user cannot be
+    consulted (headless / cron) and the topology resolves to 1D, **default to refusing** and record
+    why — never silently integrate 1D.
 
 > Mechanical enforcement of rules 2 and 16 is available via the opt-in PreToolUse
 > guard — write `.fold-cp/config.json` (see `/fold-cp:learn_context`) to enable it.

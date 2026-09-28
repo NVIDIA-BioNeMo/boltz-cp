@@ -17,26 +17,38 @@ Sharding**.
 
 2D requires `size_cp = cp0*cp1` a perfect square (`cp0 == cp1`).
 
+### 1D-CP — sub-mesh `(cp,)`, pair row-slab (experimental)
+
+| Feature class | Example shape | Placement | Per-rank local |
+|---|---|---|---|
+| Single / token / atom | `[N, C]` | `(Shard(0),)` | `[N/cp, C]` |
+| Pair (row-slab) | `[N, N, C]` | `(Shard(0),)` | `[N/cp, N, C]` (cols full) |
+| MSA | `[S, N, C]` | `(Shard(1),)` | `[S, N/cp, C]` |
+| Scalar / global | `[C]` | `(Replicate(),)` | full |
+
 `Shard(d)` = `Shard`, `Replicate()` = `Replicate`. Indices are **mesh-axis
 positional**: `placements[k]` applies to mesh axis `k`; the integer inside
 `Shard(dim)` is the **tensor** dimension.
 
 ## Data-pipeline file map (serial ↔ CP)
 
-| Concern | 2D-CP file |
-|---|---|
-| Placement dictionary | `data/module/placements.py` |
-| Atom pack/pad/scatter | `data/feature/featurizer.py` (`pad_and_scatter_atom_features_dtensor`, `pack_atom_features`) |
-| Distribute + metadata bcast + collate | `data/utils.py` (`distribute_features`, `broadcast_feature_tensors_metadata`, `CollateDTensor`, `map_subgroup_mesh_to_cpu`, `get_flattened_group`) |
-| Inference DataModule | `data/module/inferencev2.py` |
-| Training DataModule | `data/module/trainingv2.py` |
-| Symmetry features | `data/feature/symmetry.py` |
-| Cross-rank fetch-error propagation | `data/module/_error_propagation.py` |
-| Shared types | `data/module/types.py` |
+| Concern | 2D-CP file | 1D-CP file |
+|---|---|---|
+| Placement dictionary | `data/module/placements.py` | `data/module/placements_1d.py` |
+| Atom pack/pad/scatter | `data/feature/featurizer.py` (`pad_and_scatter_atom_features_dtensor`, `pack_atom_features`) | same + 1D prep |
+| Distribute + metadata bcast + collate | `data/utils.py` (`distribute_features`, `broadcast_feature_tensors_metadata`, `CollateDTensor`, `map_subgroup_mesh_to_cpu`, `get_flattened_group`) | `data/utils.py` (`CollateDTensor1D`, `map_mesh_to_cpu_1d`) |
+| Inference DataModule | `data/module/inferencev2.py` | `data/module/inferencev2_1d.py` |
+| Training DataModule | `data/module/trainingv2.py` | `data/module/trainingv2_1d.py` |
+| Cross-axis padding prep | — | `trainingv2_1d.py:_prepare_features_for_distribution` |
+| Symmetry features | `data/feature/symmetry.py` | (1d variant) |
+| Cross-rank fetch-error propagation | `data/module/_error_propagation.py` | same |
+| Shared types | `data/module/types.py` | same |
 
 Tests to mirror: `tests/distributed/data/` —
 `test_dtensor_pack_and_pad_atom_features.py`,
+`feature/test_dtensor_pack_atom_features_1d.py`,
 `test_dtensor_scatter_features.py` (`remap_atom_indices_repad`),
+`module/test_trainingv2_1d_cross_axis_padding.py`,
 `module/test_dtensor_distribute_features_error_propagation.py`.
 
 ## Axis-semantics registry (resolve N_tokens == N_atoms ambiguity)
@@ -53,7 +65,8 @@ FEATURE_AXIS_SEMANTICS = {
 }
 ```
 
-Every `"tokens"`/`"atoms"` axis is subject to the matching divisibility padding below.
+Mirror `FEATURE_AXIS_SEMANTICS_1D` in the Boltz tree. Every `"tokens"`/`"atoms"`
+axis is subject to the matching divisibility padding below.
 
 ## Co-sharding multi-semantic-axis features
 
@@ -64,8 +77,9 @@ Requirements"**) require the related axes to be **co-located on the mesh**, beca
 each rank's atom tile must correspond to its token tile, or the gather indexes off-rank
 data.
 
-- **Pair `[N, N, C]` (token×token):** `(Shard(0), Shard(1))` — both token axes on
-  the `cp0×cp1` grid (the square tile).
+- **Pair `[N, N, C]` (token×token):** 2D → `(Shard(0), Shard(1))` — both token axes on
+  the `cp0×cp1` grid (the square tile); 1D → `(Shard(0),)` — row axis sharded, column
+  full.
 - **atom→token `[N_atoms, N]` (atoms×tokens):** the atom axis and the token axis it
   indexes must be **co-sharded** (same cp axis) or **co-replicated**, never sharded on
   different axes — `distributed_gather` / `distributed_outer_gather` /
@@ -91,7 +105,7 @@ identical per-rank buffer shapes — don't hang or corrupt memory. Two kinds:
 ## Index / mask / padding consistency checklist
 
 - [ ] Local vs global indices: a feature the pipeline sends as a *local* index
-      (0..N/cp0−1) is read by the model as local, not global — and vice versa.
+      (0..N/cp−1) is read by the model as local, not global — and vice versa.
 - [ ] Mask polarity (`1=valid` vs `1=pad`) matches the model's expectation.
 - [ ] Pad positions are masked everywhere they are consumed (loss, attention bias).
 - [ ] `DTensor.from_local` is called with explicit `shape`, `stride`, `placements`
@@ -116,8 +130,8 @@ The atom-feature pipeline carries subtleties beyond the placement tables:
   moves atoms between shards and breaks the block-diagonal scheme, so the one-hot
   `atom_to_token` matrix is **not** packed. Convert it to **global token indices**
   (shard-local argmax + rank offset) *before* packing; packing the one-hot directly gives
-  wrong shard boundaries. The 2D layout is block-diagonal, so the rank offset is
-  `n_tokens_per_shard`.
+  wrong shard boundaries. 1D vs 2D differ: 1D local one-hot already spans full tokens
+  (offset 0 → argmax global); 2D is block-diagonal (offset = `n_tokens_per_shard`).
 - **Remap atom-index features after padding, before scatter.** `frames_idx` etc. store
   dense unpadded global atom indices; once each shard is padded to `max_atoms_per_shard`,
   remap via `bucketize + offset` *before* scattering, and in collation pre-scan

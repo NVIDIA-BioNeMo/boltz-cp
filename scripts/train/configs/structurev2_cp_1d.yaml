@@ -1,0 +1,8 @@
+defaults:
+  - structurev2_cp
+  - _self_
+
+# 1D (flat) context-parallel training config.
+# Inherits everything from structurev2_cp.yaml, only overrides the topology.
+# Unlike 2D, size_cp can be any positive integer (not just perfect squares).
+cp_topology: "1d"

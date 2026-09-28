@@ -11,7 +11,7 @@ description: >
   second, non-parity class — property / invariant tests (e.g. test_rng_entropy) that assert
   a structural invariant such as RNG entropy when there is no serial value oracle. Use to
   verify any output of shard_data_feats or dtensor_modules.
-argument-hint: "[path to source file under test] [unit|layer|module|workflow] [2d]"
+argument-hint: "[path to source file under test] [unit|layer|module|workflow] [1d|2d|both]"
 ---
 
 # test — prove the CP path is correct
@@ -86,14 +86,14 @@ anything downstream depends on it.
 **Before any multi-GPU run, verify the fwd+bwd decomposition on a 1×1 mesh** (single
 rank / single process, where every collective degenerates to a no-op), in fp64, CP ==
 serial. This isolates math / placement-seam / op-order bugs from collective bugs, needs
-no GPUs or multi-rank launch, and runs in seconds; a 4-rank 2×2 gloo run is a cheap second
+no GPUs or multi-rank launch, and runs in seconds; a 2-rank gloo run is a cheap second
 step. Modules that pass this 1×1 pre-check hit multi-GPU parity on the first try —
 treat it as routine, not optional. Only then build the multi-rank worker:
 
 - Spawn with `spawn_multiprocessing(worker, world_size, *args)` (Boltz testing
   utils) or `mp.spawn`.
 - Init the process group with a **per-collective timeout** (e.g. 60s) so deadlocks
-  fail fast; build the `DeviceMesh` for the selected 2D mesh.
+  fail fast; build the `DeviceMesh` for the topology.
 - Monkeypatch the distributed cleanup to a no-op when a test reinitializes groups
   in one process (port reuse) — see `tests/distributed/test_dtensor_stop_and_go.py`.
 - Wrap the worker body in **`try/finally`** to `destroy_process_group()` and free the GPU on exit;
@@ -116,9 +116,8 @@ Run serial fwd+bwd on full tensors; run CP fwd+bwd on sharded DTensors; compare.
 
 - **Explicit random `grad_output`** for backward — never `.sum().backward()`
   (uniform grads mask sign/permutation bugs).
-- **Sharding is active when either 2D mesh axis has size > 1:**
-  `local.shape[sharded_dim] < global.shape[sharded_dim]` — skip for `cp=(1,1)`
-  (a valid debugging mesh where local == global).
+- **Sharding is active (when `cp_size > 1`):** `local.shape[sharded_dim] < global.shape[sharded_dim]`
+  — skip for `cp=1` (a valid debugging mesh where local == global).
 - **Replicated values identical across ranks** (`assert_all_identical`).
 - **Gradients non-zero** (and finite).
 - **Perturb/randomize zero-initialized params first** — AF/residual "final" projections
@@ -130,14 +129,14 @@ Run serial fwd+bwd on full tensors; run CP fwd+bwd on sharded DTensors; compare.
 - **fp64 + `assert_close` default tolerances.** If it only passes after loosening
   `atol`, that is a bug signal — derive the tolerance from the error budget, do not
   tune it (Rule 15).
-- At least one **adversarial/boundary** case (a non-power-of-two per-axis 2D mesh such as
-  `cp=(3,3)`, a padded axis, a single-element shard).
+- At least one **adversarial/boundary** case (non-power-of-two `cp`, a padded
+  axis, a single-element shard).
 
 ## Step 6 — Parametrize and prefer CUDA
 
 One test function parametrized over a tuple of mesh configs (do not copy-paste per
-size). Prefer CUDA parametrizations; keep at most one CPU param (e.g. a 3×3 mesh) for
-CI path coverage.
+size). Prefer CUDA parametrizations; keep at most one CPU param (e.g. non-power-of-two
+`cp`) for CI path coverage.
 
 ## Step 7 — Run, with timeout and logs
 
@@ -162,7 +161,7 @@ Some correctness properties are **not** numerical equality to the serial referen
 serial run is not a value oracle for them. The oracle is a **structural invariant** the
 distributed run must satisfy. Write a *property test* when:
 
-- the quantity is **random / not reproducible across mesh configurations** — RNG and noise: no
+- the quantity is **random / not reproducible across topologies** — RNG and noise: no
   distributed RNG numerically reproduces an all-gathered single-device draw today, so you
   can assert only its *entropy structure*, not its values; or
 - the property is about **layout / determinism / consistency** rather than numbers — e.g.
@@ -227,7 +226,7 @@ to any serial value. Mechanism (skeleton in [reference.md](reference.md)):
 ## Output contract
 
 - A parity test at the chosen level that passes against the serial reference and
-  contains every anti-vacuous assertion above, parametrized over the selected 2D
+  contains every anti-vacuous assertion above, parametrized over the topology's
   mesh configs.
 - The test log on disk; a one-line statement of the tolerance used and why. The log is
   **self-verifying** — it prints the measured difference vs the tolerance and a one-line pass of

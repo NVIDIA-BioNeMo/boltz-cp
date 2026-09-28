@@ -16,7 +16,7 @@ review is adversarial and cannot self-certify — it inspects and verdicts, neve
 ```
 TASK: <implement CP module X / write parity test for X>
 LEVEL: <unit | layer | module | workflow>
-TOPOLOGY: 2d, world_size=<N>
+TOPOLOGY: <1d | 2d>, world_size=<N>
 CONTRACT (from module_map.md): serial=<file>; cp=<file>; tech §=<n>;
           input placements=<...>; output placements=<...>;
           collectives=<...>; backward budget=<single|pair>.
@@ -58,7 +58,7 @@ The lead does not advance the wave while any coupled seam is unreconciled.
 ```
 [ ] serial fwd+bwd is the comparison ground truth; no serial file edited (Rule 2)
 [ ] explicit random grad_output; NO .sum().backward() (Rule 14)
-[ ] sharding active when either 2D mesh axis has size >1: local.shape[shard_dim] < global on sharded dims (skip at cp=(1,1))
+[ ] sharding active (when cp_size>1): local.shape[shard_dim] < global on sharded dims (skip at cp=1)
 [ ] distributed signatures accept only DTensor (placements + shapes checked); no naked plain-tensor distributed code (Rule 6)
 [ ] replicated values identical across ranks
 [ ] gradients non-zero and finite

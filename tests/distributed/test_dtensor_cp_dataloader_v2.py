@@ -20,6 +20,8 @@
 # DEALINGS IN THE SOFTWARE.
 
 # System imports
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -614,6 +616,56 @@ def _compare_features(
     )
 
 
+@contextmanager
+def _stabilize_independent_featurization() -> Iterator[None]:
+    """Temporarily pin duplicated serial/CP featurization to one CPU thread."""
+    previous_num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        assert torch.get_num_threads() == 1
+        yield
+    finally:
+        torch.set_num_threads(previous_num_threads)
+
+
+def test_stabilize_independent_featurization_restores_num_threads() -> None:
+    """Verify featurization thread pinning restores the prior thread count.
+
+    Returns
+    -------
+    None
+        The test passes when context-manager and decorator exits restore the
+        prior thread count, including after an exception.
+    """
+    original_num_threads = torch.get_num_threads()
+    baseline_num_threads = 2 if original_num_threads != 2 else 3
+    torch.set_num_threads(baseline_num_threads)
+    try:
+        context = _stabilize_independent_featurization()
+        assert torch.get_num_threads() == baseline_num_threads
+
+        with context:
+            assert torch.get_num_threads() == 1
+        assert torch.get_num_threads() == baseline_num_threads
+
+        @_stabilize_independent_featurization()
+        def decorated_call_num_threads() -> int:
+            return torch.get_num_threads()
+
+        assert torch.get_num_threads() == baseline_num_threads
+        assert decorated_call_num_threads() == 1
+        assert torch.get_num_threads() == baseline_num_threads
+
+        with pytest.raises(RuntimeError, match="test restoration"):
+            with _stabilize_independent_featurization():
+                assert torch.get_num_threads() == 1
+                raise RuntimeError("test restoration")
+        assert torch.get_num_threads() == baseline_num_threads
+    finally:
+        torch.set_num_threads(original_num_threads)
+
+
+@_stabilize_independent_featurization()
 def parallel_assert_cp_inference_dataloader(
     rank: int,
     processed,
@@ -624,6 +676,38 @@ def parallel_assert_cp_inference_dataloader(
     grid_group_sizes: Dict[str, int],
     env_map: Optional[dict[str, str]] = None,
 ):
+    """Compare serial and CP inference dataloader features on one worker rank.
+
+    Parameters
+    ----------
+    rank : int
+        Worker rank assigned by ``torch.multiprocessing.spawn``.
+    processed : BoltzProcessedInput
+        Preprocessed inference input shared with the worker.
+    canonical_mols_dir : Path
+        Directory containing canonical molecule definitions.
+    local_batch_size : int
+        Number of samples processed per data-parallel rank.
+    device_type : str
+        Device type used to initialize distributed process groups.
+    backend : str
+        Distributed backend used for device process groups.
+    grid_group_sizes : Dict[str, int]
+        Sizes of the data- and context-parallel process groups.
+    env_map : dict[str, str], optional
+        Per-rank environment overrides. ``"<INPUT_RANK>"`` resolves to
+        ``rank``.
+
+    Returns
+    -------
+    None
+        The worker returns after serial and CP features pass parity checks.
+
+    Raises
+    ------
+    AssertionError
+        If serial and CP feature values, shapes, or placements differ.
+    """
     monkeypatch = pytest.MonkeyPatch()
     if env_map is not None:
         for var_name, value in env_map.items():
@@ -1018,6 +1102,7 @@ def test_atom_to_token_sharding_consistency(
     )
 
 
+@_stabilize_independent_featurization()
 def parallel_assert_cp_training_dataloader(
     rank: int,
     training_data_dir: Path,
@@ -1028,6 +1113,38 @@ def parallel_assert_cp_training_dataloader(
     env_map: Optional[dict[str, str]] = None,
     dataloader_kind: str = "train",
 ):
+    """Compare serial and CP training dataloader features on one worker rank.
+
+    Parameters
+    ----------
+    rank : int
+        Worker rank assigned by ``torch.multiprocessing.spawn``.
+    training_data_dir : Path
+        Directory containing preprocessed training samples.
+    canonical_mols_dir : Path
+        Directory containing canonical molecule definitions.
+    device_type : str
+        Device type used to initialize distributed process groups.
+    backend : str
+        Distributed backend used for device process groups.
+    grid_group_sizes : Dict[str, int]
+        Sizes of the data- and context-parallel process groups.
+    env_map : dict[str, str], optional
+        Per-rank environment overrides. ``"<INPUT_RANK>"`` resolves to
+        ``rank``.
+    dataloader_kind : str, optional
+        Dataloader path to validate: ``"train"`` or ``"val"``.
+
+    Returns
+    -------
+    None
+        The worker returns after serial and CP features pass parity checks.
+
+    Raises
+    ------
+    AssertionError
+        If serial and CP feature values, shapes, or placements differ.
+    """
     local_batch_size = 1
     monkeypatch = pytest.MonkeyPatch()
     if env_map is not None:

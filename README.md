@@ -175,7 +175,7 @@ has a default:
 |---|---|---|
 | `training` | **scope** | which workflow to CP-ify: `inference` / `training` / `all` (default `all`). |
 | `trunk` | **focus** | subsystem to integrate **first** — an ordering seed, not a filter (the whole model stays in scope). e.g. `trunk` / `diffusion` / `confidence` / `data`. Absent ⇒ data pipeline first. |
-| `dp:1 cp:(2,2)` | **mesh** | device mesh used for every parity test, benchmark, and profile: `dp` data-parallel replicas × a `cp0×cp1` CP grid. `cp:(2,2)` ⇒ 2D-CP, `world_size = 4`. Absent ⇒ chosen by `build_infra`. |
+| `dp:1 cp:(2,2)` | **mesh** | device mesh used for every parity test, benchmark, and profile: `dp` data-parallel replicas × a `cp0×cp1` CP grid. `cp:(2,2)` ⇒ 2D-CP, `world_size = 4`; `cp:N` ⇒ 1D-CP. Absent ⇒ chosen by `build_infra`. |
 | `model:~/code/myfold` | **model path** | your serial model code to CP-ify. Absent ⇒ resolved by tracing. |
 | `ref:~/code/boltz-cp` | **reference repo** | the CP reference implementation every mapping cites (this repo). Absent ⇒ `$BOLTZ_CP_REPO` env var / filesystem search. |
 | `--local` | **launch env** | run multi-rank jobs on local GPUs; `--slurm` uses a cluster. |
@@ -211,19 +211,19 @@ called as **`/fold-cp:<skill> <args>`** in Claude Code or **`$<skill> <args>`** 
   /fold-cp:build_infra --local 4
   ```
 - **`shard_data_feats`** — assign DTensor placements and shard the data features.
-  `[2d] [feature group: atom|token|msa|pair|all]`
+  `[1d | 2d] [feature group: atom|token|msa|pair|all]`
   ```
   /fold-cp:shard_data_feats 2d all
   ```
 - **`dtensor_modules`** — port a serial layer/module to a DTensor CP module.
-  `[module name] [2d]`
+  `[module name] [1d | 2d]`
   ```
   /fold-cp:dtensor_modules TriangleMultiplication 2d
   ```
 - **`test`** — write/run multi-rank parity tests (CP vs serial ground truth).
-  `[source file under test] [unit|layer|module|workflow] [2d]`
+  `[source file under test] [unit|layer|module|workflow] [1d|2d|both]`
   ```
-  /fold-cp:test src/boltz/distributed/model/trimul_cp.py module 2d
+  /fold-cp:test src/boltz/distributed/model/trimul_cp.py module both
   ```
 - **`dist_lifecycle`** — wire the distributed training/inference lifecycle.
   `[wrap | checkpoint | resume | ema | optimizer]`

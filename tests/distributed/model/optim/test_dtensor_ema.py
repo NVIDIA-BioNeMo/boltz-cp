@@ -234,12 +234,12 @@ def _parallel_assert_ema_inference_mode(rank: int, payload: tuple[Any, ...]) -> 
 
         with torch.inference_mode(True):
             ema.replace_model_weights(model)
-            for k, v in model.state_dict().items():
+            for k, v in model.state_dict(keep_vars=True).items():
                 assert isinstance(v, DTensor), f"DTensor lost for '{k}' under inference_mode replace"
                 assert_tensors_identical(v.to_local(), ema_snapshot[k])
 
             ema.restore_original_weights(model)
-            for k, v in model.state_dict().items():
+            for k, v in model.state_dict(keep_vars=True).items():
                 assert isinstance(v, DTensor), f"DTensor lost for '{k}' under inference_mode restore"
                 assert_tensors_identical(v.to_local(), training_weights[k])
     finally:

@@ -208,8 +208,15 @@ def _create_distogram_distributed_model(
 def _create_distogram_distributed_data_module(
     data_config: Any,
     dist_manager: DistributedManager,
+    cp_topology: str = "2d",
 ) -> DistogramTrainDataModule:
-    """Monkeypatched ``_create_distributed_data_module`` for distogram tests."""
+    """Monkeypatched ``_create_distributed_data_module`` for distogram tests.
+
+    Accepts ``cp_topology`` for signature compatibility with
+    :func:`boltz.distributed.train._create_distributed_data_module`, which
+    forwards ``cfg.cp_topology`` from ``train.py``.  The test data module
+    does not branch on topology today.
+    """
     return DistogramTrainDataModule(
         seq_len=data_config["seq_len"],
         token_z=data_config["token_z"],

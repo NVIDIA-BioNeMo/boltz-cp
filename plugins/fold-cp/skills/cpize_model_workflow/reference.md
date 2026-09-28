@@ -13,14 +13,14 @@ Resolved once in SKILL.md Step 1 and threaded to the phase that needs them:
 | reference repo | `ref:<path>` or `$BOLTZ_CP_REPO` env | phase 0 `learn_context` — every mapping cites it |
 | model code path | `model:<path>` | phase 0 `learn_context` |
 | scope | `inference` / `training` / `all` | phase 0 `learn_context`; gates which phases run |
-| **mesh config** | `dp:<d> cp:(<a>,<b>)` (2D) | phase 1 `build_infra` + the `cp size` of every test / benchmark / profile + Step-4 slots |
+| **mesh config** | `dp:<d> cp:(<a>,<b>)` (2D) or `dp:<d> cp:<n>` (1D) | phase 1 `build_infra` + the `cp size` of every test / benchmark / profile + Step-4 slots |
 | launch env | `--local` / `--slurm` | phase 1 `build_infra` |
 | data source | `data:<path>` / `--random` | parity tests (phases 2–5) + benchmark (phase 7) |
 | focus area | subsystem / module | Steps 2–3 filter + sort (below) |
 | resume | `resume` | re-enter from the ledger |
 
 The **mesh config is the primary device mesh for testing, benchmarking, and profiling**:
-`cp:(a,b)` ⇒ 2D (`cp0×cp1`), `dp` defaults to 1, `world_size = dp·cp0·cp1`. Pin it at the
+`cp:(a,b)` ⇒ 2D (`cp0×cp1`), `cp:n` ⇒ 1D, `dp` defaults to 1, `world_size = dp·∏cp`. Pin it at the
 front door so the parity tests, the benchmark, and the mem/nsys profiles all run on the **same**
 mesh; it is the single source for each downstream skill's `cp size` argument and for the GPU-slot
 bound.
@@ -40,7 +40,9 @@ interactive, ask **once** (`AskUserQuestion`, default automatic). Record it in t
   loop (diagnose and fix the implementation — do **not** stop, Rule 3); a **design fork** is resolved
   by the sensible default and recorded in the ledger. **Halt only on a confirmed _critical blocker_**
   (below) — and then report exactly what is blocking and what input is needed, rather than silently
-  stopping.
+  stopping. The **one** front-door pause allowed under `--automatic` is the one-time **1D-CP
+  experimental sign-off (Rule 25)**: if the mesh resolves to 1D, get the at-own-risk acknowledgement
+  before driving (a safety gate, not a per-wave pause); once given, the drive runs to completion.
 - **`--manual-approve` — pause at every wave boundary.** Before starting the next wave, give the
   user (a) a one-screen **summary of the phases/waves finished** and their verified gates, (b) the
   **next wave/phase plan** (its tasks, fan-out-vs-direct, GPU-slot bound), and (c) an explicit
@@ -68,7 +70,7 @@ Every task in the master list carries:
 | `deps` | ids of upstream tasks (data-flow producers, infra) | topo-sort + ready-wave test |
 | `status_kind` | `reuse` / `adapt` / `new` | reuse-before-new ordering (rule 3) |
 | `state` | `todo` / `in_flight` / `done` / `blocked` / `dirty` / `out-of-scope` | the drive loop + resume; `out-of-scope` = excluded by the focus area (Step 2), re-includable on widening |
-| `gpu` | `world_size` it needs to test (1 for spikes, ≥4 for 2D) | slot bounding |
+| `gpu` | `world_size` it needs to test (1 for spikes, ≥4 for 2D, ≥2 for 1D) | slot bounding |
 | `risk` | `low` / `med` / `high` (+ one-line reason) | risk-first ordering (rule 4) |
 | `gate` | the phase gate that closes it (below) | "done" definition |
 | `artifact` | path of the proof (test log, doc, profile report) | gate verification |
@@ -84,7 +86,7 @@ A **focus area** (passed in `$ARGUMENTS`) scopes the conductor to part of the mo
 the whole program. It is a model **subsystem or module** — `trunk`/`pairformer`, `diffusion`,
 `confidence`, `data` (featurizer/pipeline), `losses`, or a named module — resolved against the §4
 module map / §3 feature inventory. It is **orthogonal** to `scope` (inference/training/all —
-*which workflow*) and the 2D mesh config; focus is *which part of the model*.
+*which workflow*) and `topology` (1d/2d — *which mesh*); focus is *which part of the model*.
 
 - **Filter (Step 2):** keep the focus subsystem + its **transitive dependencies**; mark the rest
   `out-of-scope` (don't delete — a later run can widen).
@@ -165,8 +167,7 @@ A phase advances only when its gate is verified **on disk** (Rule 3 / Rule 14):
 - **1 Infra:** `docs/cp_infra.md` records topology + `world_size` + launch recipe; the shipped
   P2P / all-gather / all-reduce / DTensor smoke tests pass (build_infra).
 - **2 Data:** the data-feature parity test is green; sharded local shape < global on sharded
-  dims (when either 2D mesh axis has size > 1); masks/indices consistent (Rules 8/9);
-  collective loops use sorted keys (Rule 7).
+  dims (when `cp_size > 1`); masks/indices consistent (Rules 8/9); collective loops use sorted keys (Rule 7).
 - **3 Module (per module):** parity test green vs serial fwd+bwd, non-vacuous (Rule 14);
   backward budget matches forward (Rule 11); coupled seams reconciled (Rule 4); no serial file
   edited (Rule 2); pre-commit clean.
@@ -196,7 +197,7 @@ A phase advances only when its gate is verified **on disk** (Rule 3 / Rule 14):
 # CP integration plan (cpize_model_workflow)
 
 - ref ($BOLTZ_CP_REPO): <path>   model: <path>   launch: <local|slurm>   data: <path|random>
-- scope: <inference|training|all>   focus: <subsystem|—>   mesh: dp=<d> cp=(<a>,<b>)   (world_size=<N>)
+- scope: <inference|training|all>   focus: <subsystem|—>   mesh: dp=<d> cp=(<a>,<b>)|<n>   (world_size=<N>)
 - Updated: <date>   |   legend: state = todo / in_flight / done / blocked / dirty / out-of-scope
 
 | id | phase | skill | deps | kind | risk | state | gate / artifact |

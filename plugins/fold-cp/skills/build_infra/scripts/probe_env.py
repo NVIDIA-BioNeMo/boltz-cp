@@ -22,9 +22,10 @@
 """Probe the local software/hardware stack for CP testability (no distributed init).
 
 Prints a JSON report on stdout and a human summary on stderr. The
-``recommended_cp`` block maps the live GPU count to whether 2D CP can be tested
-here, following the build_infra rules:
+``recommended_cp`` block maps the live GPU count to which CP topologies can be
+tested here, following the build_infra rules:
   * 2D-CP needs a perfect-square cp size, smallest 4 (cp0=cp1=2).
+  * 1D-CP needs cp>=2; cp=3 is the recommended dev size (also non-power-of-two).
   * Full end-to-end integration wants 8 GPUs.
 
 It also reports the resource prerequisites the fold-cp skills care about (R4/R10):
@@ -67,10 +68,26 @@ def recommend(n: int) -> dict:
         "dp": (n // cp2d) if cp2d >= 4 else 0,
         "world_size": cp2d * (n // cp2d) if cp2d >= 4 else 0,
     }
+    # 1D: cp=3 if we have it, else 2; dp uses the remainder
+    rec["can_1d"] = n >= 2
+    if n >= 3:
+        cp1d = 3
+    elif n == 2:
+        cp1d = 2
+    else:
+        cp1d = 0
+    rec["cp1d"] = {
+        "cp": cp1d,
+        "dp": (n // cp1d) if cp1d else 0,
+        "world_size": cp1d * (n // cp1d) if cp1d else 0,
+    }
     rec["can_integration"] = n >= 8
     if rec["can_2d"]:
         rec["suggested_world_size"] = rec["cp2d"]["size_cp"]
         rec["suggested_topology"] = "2d"
+    elif rec["can_1d"]:
+        rec["suggested_world_size"] = cp1d
+        rec["suggested_topology"] = "1d"
     else:
         rec["suggested_world_size"] = 0
         rec["suggested_topology"] = "none-local (escalate to SLURM)"
@@ -193,6 +210,7 @@ def main() -> int:
     print("\n=== CP testability summary ===", file=sys.stderr)
     print(f"GPUs detected: {n}", file=sys.stderr)
     print(f"  2D-CP testable: {r['can_2d']}  -> {r['cp2d']}", file=sys.stderr)
+    print(f"  1D-CP testable: {r['can_1d']}  -> {r['cp1d']}", file=sys.stderr)
     print(f"  integration (8 GPU): {r['can_integration']}", file=sys.stderr)
     print(
         f"  suggested: topology={r['suggested_topology']} " f"world_size={r['suggested_world_size']}",

@@ -612,6 +612,189 @@ def map_subgroup_mesh_to_cpu(dist_manager: "DistributedManager") -> DeviceMesh:
         raise ValueError(f"Unknown device type {device_mesh.device_type}")
 
 
+class CollateDTensor1D:
+    """Collate DTensors for 1D CP on a ``(dp, cp)`` mesh.
+
+    Mirrors :class:`CollateDTensor` but expects a 2D device mesh
+    ``(dp, cp)`` instead of the 3D ``(dp, cp_axis_0, cp_axis_1)`` mesh
+    required by the 2D variant.
+    """
+
+    def __init__(self, output_device_mesh: DeviceMesh):
+        if output_device_mesh.ndim != 2:
+            raise ValueError(f"CollateDTensor1D expects a DP-CP device mesh but got ndim {output_device_mesh.ndim}")
+        self._output_device_mesh = output_device_mesh
+
+    def __call__(self, data: list[dict[str, DTensor]]) -> dict[str, DTensor]:
+        """Collate a list of per-sample feature dicts into a batched dict.
+
+        Parameters
+        ----------
+        data : list[dict[str, DTensor]]
+            Per-sample feature dictionaries produced by the dataset.
+
+        Returns
+        -------
+        dict[str, DTensor]
+            Collated features with an additional DP (batch) shard dimension.
+        """
+        keys = data[0].keys()
+
+        # Pre-scan for atom-index remapping (same logic as CollateDTensor).
+        _ATOM_DIM_REFERENCE_KEY = "atom_pad_mask"
+        has_atom_index_features = any(k in ATOM_INDEX_FEATURES for k in keys)
+        if has_atom_index_features and _ATOM_DIM_REFERENCE_KEY in keys:
+            ref_locals = [d[_ATOM_DIM_REFERENCE_KEY].to_local() for d in data]
+            old_atoms_per_sample = [v.shape[0] for v in ref_locals]
+            local_max_atoms = max(old_atoms_per_sample)
+
+            global_max_atoms_t = torch.tensor([local_max_atoms], device=self._output_device_mesh.device_type)
+            group = self._output_device_mesh.get_group(0)
+            torch.distributed.all_reduce(global_max_atoms_t, op=torch.distributed.ReduceOp.MAX, group=group)
+            final_atoms_per_shard = int(global_max_atoms_t.item())
+        else:
+            old_atoms_per_sample = None
+            final_atoms_per_shard = None
+
+        collated = {}
+        for key in keys:
+            if key in NON_SHARDED_FEATURES_V2:
+                collated[key] = [d[key] for d in data]
+                continue
+
+            values = [d[key] for d in data]
+            placements = values[0].placements
+
+            values_local = [value.to_local() for value in values]
+
+            if key in ATOM_INDEX_FEATURES and old_atoms_per_sample is not None:
+                for i in range(len(values_local)):
+                    values_local[i] = remap_atom_indices_repad(
+                        values_local[i], old_atoms_per_sample[i], final_atoms_per_shard
+                    )
+
+            values_local, _ = pad_to_max(values_local, 0)
+            values_local = values_local.contiguous()
+
+            local_shape_max = torch.tensor(
+                values_local.shape,
+                device=self._output_device_mesh.device_type,
+            )
+            group = self._output_device_mesh.get_group(0)
+            torch.distributed.all_reduce(local_shape_max, op=torch.distributed.ReduceOp.MAX, group=group)
+
+            if values_local.shape != tuple(local_shape_max.tolist()):
+                current_shape = values_local.shape
+                target_shape = tuple(local_shape_max.tolist())
+                num_dims = len(current_shape)
+                padding = []
+                for i in range(num_dims):
+                    dim_idx = num_dims - 1 - i
+                    pad_needed = target_shape[dim_idx] - current_shape[dim_idx]
+                    padding.extend([0, pad_needed])
+                values_local = torch.nn.functional.pad(values_local, tuple(padding), value=0)
+
+            # Build global shape: dp dimension scales by dp size, cp
+            # dimensions scale according to placements on the single cp axis.
+            shape_scaling = torch.ones_like(local_shape_max)
+            shape_scaling[0] = self._output_device_mesh.shape[0]  # dp dimension
+
+            new_placements = [Shard(0)]  # batch dim -> Shard on dp
+            for placement in placements:
+                if isinstance(placement, Shard):
+                    # +1 because input placement lacks dp dimension
+                    shape_scaling[placement.dim + 1] = self._output_device_mesh.shape[1]
+                    new_placements.append(Shard(placement.dim + 1))
+                elif isinstance(placement, Replicate):
+                    new_placements.append(placement)
+                else:
+                    raise ValueError(f"Unsupported placement: {placement}")
+
+            global_shape = local_shape_max * shape_scaling
+            strides = LayoutRightMap(tuple(global_shape.tolist())).strides
+
+            collated[key] = DTensor.from_local(
+                values_local,
+                device_mesh=self._output_device_mesh,
+                placements=new_placements,
+                shape=torch.Size(global_shape.tolist()),
+                stride=strides,
+            )
+
+        return collated
+
+
+def map_mesh_to_cpu_1d(dist_manager: "DistributedManager") -> DeviceMesh:
+    """Create a CPU device mesh for 1D CP.
+
+    Returns a 2D ``(dp_cpu, cp_cpu)`` :class:`DeviceMesh` mirroring the
+    GPU mesh ``(dp, cp)`` but backed by gloo process groups on CPU.
+
+    Parameters
+    ----------
+    dist_manager : DistributedManager
+        Initialised manager with ``dp`` and ``cp`` groups.
+
+    Returns
+    -------
+    DeviceMesh
+        CPU device mesh with dim names ``("dp_cpu", "cp_cpu")``.
+    """
+    device_mesh = dist_manager.device_mesh
+    if device_mesh.device_type == "cpu":
+        return DeviceMesh.from_group(
+            group=[
+                dist_manager.group["dp"],
+                dist_manager.group["cp"],
+            ],
+            device_type="cpu",
+            mesh=device_mesh.mesh.clone(),
+            mesh_dim_names=("dp_cpu", "cp_cpu"),
+        )
+    elif device_mesh.device_type == "cuda":
+        if "dp_cpu" not in dist_manager.group_ranks:
+            dist_manager.create_group(
+                "dp_cpu",
+                dist_manager.group_ranks["dp"],
+                backend="gloo",
+                use_local_synchronization=True,
+            )
+        if "cp_cpu" not in dist_manager.group_ranks:
+            dist_manager.create_group(
+                "cp_cpu",
+                dist_manager.group_ranks["cp"],
+                backend="gloo",
+                use_local_synchronization=True,
+            )
+
+        device_mesh_cpu = DeviceMesh.from_group(
+            group=[
+                dist_manager.group["dp_cpu"],
+                dist_manager.group["cp_cpu"],
+            ],
+            device_type="cpu",
+            mesh=device_mesh.mesh.clone(),
+            mesh_dim_names=("dp_cpu", "cp_cpu"),
+        )
+
+        cuda_group_ranks = (
+            dist_manager.group_ranks["dp"],
+            dist_manager.group_ranks["cp"],
+        )
+        cpu_group_ranks = tuple(
+            torch.distributed.get_process_group_ranks(group) for group in device_mesh_cpu.get_all_groups()
+        )
+        for cuda_ranks, cpu_ranks in zip(cuda_group_ranks, cpu_group_ranks):
+            if set(cuda_ranks) != set(cpu_ranks):
+                raise ValueError(
+                    f"New CPU group ranks {cpu_ranks} do not match " f"with existing CUDA group ranks {cuda_ranks}"
+                )
+
+        return device_mesh_cpu
+    else:
+        raise ValueError(f"Unknown device type {device_mesh.device_type}")
+
+
 def get_flattened_group(device_mesh: DeviceMesh, backend: Optional[str] = None) -> ProcessGroup:
     """Get the flattened process group from a device mesh.
 

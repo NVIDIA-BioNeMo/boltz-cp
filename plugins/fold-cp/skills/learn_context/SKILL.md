@@ -121,7 +121,7 @@ differ):
 - Diffusion / structure head → diffusion module + conditioning.
 - Confidence head, losses (distogram, pLDDT, PDE, smooth-LDDT) → §10–§11.
 
-Produce a mapping table: serial block → candidate 2D CP file(s) → tech
+Produce a mapping table: serial block → candidate CP file(s) (2D and 1D) → tech
 guide § → "reuse as-is / adapt / new". Flag any block with **no** CP counterpart
 as new work for `dtensor_modules`.
 
@@ -141,7 +141,11 @@ Use `AskUserQuestion` only for what tracing cannot settle. High-value questions:
 
 - Which components does the user want CP'd first (scope the effort)?
 - Where is the **serial ground truth** (the read-only reference paths)?
-- What perfect-square 2D CP mesh should be targeted (minimum 4 GPUs)?
+- Target CP topology — **2D (supported, default; ≥4 GPUs / perfect-square mesh)** or **1D
+  (EXPERIMENTAL; ≥2 GPUs)?** If the user wants 1D (or only 1D is feasible), apply the **1D-CP
+  experimental gate (Rule 25)**: warn that 1D has known pending bugs, unestablished parity, and paths
+  gated at `cp>1`; get a one-time at-own-risk confirmation (proceed-1D / switch-to-2D / abort); and
+  record the acknowledgement in §0 of the deliverable. Default to 2D.
 - Is real inference/training data available for parity tests, or should tests use
   synthesized random features?
 

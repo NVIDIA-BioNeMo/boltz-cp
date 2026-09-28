@@ -792,13 +792,6 @@ def parallel_assert_run_predict_v2(
                 _assert_confidence_values_sane(conf_data, f"{name_sample} golden model_{i}")
             _compare_confidence_golden_vs_distributed(golden_jsons_data, dist_jsons_data, name_sample)
 
-        if struct_errors:
-            raise AssertionError(
-                f"Distributional comparison failed for {name_sample}:\n"
-                + "\n".join(struct_errors)
-                + f"\nCheck CIF: {cif_files[0]}"
-            )
-
             # 4. pLDDT npz files
             plddt_files = sorted(struct_dir.glob(f"plddt_{name_sample}_model_*.npz"))
             assert len(plddt_files) == n_diffusion_samples, (
@@ -833,6 +826,13 @@ def parallel_assert_run_predict_v2(
                     assert pae.ndim == 2, f"pae should be 2D, got shape {pae.shape} in {af}"
                     assert pae.shape[0] == pae.shape[1], f"pae should be square, got {pae.shape} in {af}"
                     assert np.all(np.isfinite(pae)), f"pae contains non-finite values in {af}"
+
+        if struct_errors:
+            raise AssertionError(
+                f"Distributional comparison failed for {name_sample}:\n"
+                + "\n".join(struct_errors)
+                + f"\nCheck CIF: {cif_files[0]}"
+            )
 
 
 @pytest.mark.predict
