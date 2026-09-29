@@ -56,6 +56,7 @@ from boltz.distributed.data.feature.featurizer_utils import (
     get_pair_mask,
 )
 from boltz.distributed.data.types import PairMaskMode
+from boltz.distributed.port_utils import find_free_port
 
 # Try to import from main, fall back to defaults if not available
 try:
@@ -659,6 +660,29 @@ def skip_if_cuda_not_avail_or_device_count_less_than_word_size(device_type: str,
             pytest.skip(f"skip cuda test because torch.cuda.device_count() < {world_size}")
 
 
+@contextmanager
+def _file_system_sharing_strategy():
+    """Bound file-descriptor use while passing CPU tensors to spawned workers."""
+    previous_strategy = torch.multiprocessing.get_sharing_strategy()
+    if previous_strategy == "file_system" or "file_system" not in torch.multiprocessing.get_all_sharing_strategies():
+        yield
+        return
+
+    torch.multiprocessing.set_sharing_strategy("file_system")
+    try:
+        yield
+    finally:
+        torch.multiprocessing.set_sharing_strategy(previous_strategy)
+
+
+_DYNAMIC_MASTER_PORT_ENV = "BOLTZ_TEST_DYNAMIC_MASTER_PORT"
+
+
+def _is_tcpstore_address_in_use(error: Exception) -> bool:
+    message = str(error)
+    return "server socket has failed to listen" in message and "EADDRINUSE" in message
+
+
 def spawn_multiprocessing(fn: Callable[[int, ...], None], world_size: int, *args) -> None:
     """Spawn multiple processes using torch.multiprocessing for distributed testing.
 
@@ -693,12 +717,35 @@ def spawn_multiprocessing(fn: Callable[[int, ...], None], world_size: int, *args
         - This function blocks until all spawned processes complete
     """
     torch.multiprocessing.set_start_method("spawn", force=True)
-    torch.multiprocessing.spawn(
-        fn=fn,
-        args=args,
-        nprocs=world_size,
-        join=True,
-    )
+    # The default Linux sharing strategy caches one file descriptor per CPU
+    # tensor storage. Large parity-test payloads can exceed a normal 1024-FD
+    # soft limit before the first worker starts. Filename-backed sharing keeps
+    # descriptor use bounded; torch_shm_manager owns crash cleanup.
+    dynamic_master_port = os.environ.get(_DYNAMIC_MASTER_PORT_ENV) == "1"
+    attempts = 2 if dynamic_master_port else 1
+    with _file_system_sharing_strategy():
+        for attempt in range(attempts):
+            if dynamic_master_port:
+                # setup_env allocates an initial port for tests that initialize
+                # in the parent. Refresh it at the spawn boundary to minimize
+                # the unreserved close-before-TCPStore-bind interval.
+                os.environ["MASTER_PORT"] = str(find_free_port())
+            try:
+                torch.multiprocessing.spawn(
+                    fn=fn,
+                    args=args,
+                    nprocs=world_size,
+                    join=True,
+                )
+                return
+            except Exception as error:
+                if attempt + 1 == attempts or not _is_tcpstore_address_in_use(error):
+                    raise
+                warnings.warn(
+                    "TCPStore port was claimed before rank 0 could bind; retrying once with a new port.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
 
 def assert_close_statistics(
@@ -1049,11 +1096,14 @@ def assert_no_percentile_upshift(
             # Assumption: we don't care down-shifting of because they only implies
             # overall higher consistency of the result than the alternative
             continue
+        tol_kwargs = {}
+        if atol is not None or rtol is not None:
+            tol_kwargs["atol"] = atol if atol is not None else 0
+            tol_kwargs["rtol"] = rtol if rtol is not None else 0
         torch.testing.assert_close(
             quantiles_diff_abs_result[i],
             quantiles_diff_abs_alternative[i],
-            atol=atol,
-            rtol=rtol,
+            **tol_kwargs,
             msg=lambda m: (
                 f"""
                 shift at {p * 100} percentile:\n{m}\n
@@ -2188,6 +2238,7 @@ def random_features(
     selected_keys: Optional[list[str]] = None,
     num_disto_bins: int = 64,
     rng: Optional[torch.Generator] = None,
+    cp_size: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Generate random feature tensors matching the shapes and dtypes of selected_keys features.
 
@@ -2217,6 +2268,9 @@ def random_features(
         Number of bins for distogram target. Default is 64.
     rng : Optional[torch.Generator]
         Optional random generator for deterministic sampling without modifying global RNG state.
+    cp_size : int
+        Context parallelism world size. Used to round r_set_to_rep_atom's N_R dimension
+        to a multiple of cp_size for even sharding. Default is 1 (no adjustment).
 
     Returns
     -------
@@ -2311,9 +2365,11 @@ def random_features(
     # - R-set token indices are identical across batch (intentional for consistent sharding)
     #
     n_r = max(
-        1,
+        cp_size,
         n_tokens - torch.randint(0, max(1, n_tokens // 4), (1,), device=device, generator=rng).item(),
     )  # Random N_R <= n_tokens
+    # Round to nearest multiple of cp_size for even sharding
+    n_r = (n_r // cp_size) * cp_size
 
     # Randomly select which tokens are in the R-set (sorted for consistency across batch)
     r_set_token_indices = torch.randperm(n_tokens, device=device, generator=rng)[:n_r].sort().values
@@ -3784,3 +3840,117 @@ def make_pb_test_data(n_tok, n_atom, mols_dir, mol_name="PHE", batch_size=1, n_s
 
     out = {"sample_atom_coords": sample_coords}
     return batch, out
+
+
+def make_divergent_cyclic_rel_pos_feats(
+    size_batch: int,
+    n_tokens: int,
+    cyclic_period_val: int = 3,
+    rng: Optional[torch.Generator] = None,
+) -> dict[str, torch.Tensor]:
+    """Build the six relative-position integer features with a layout that is
+    *rank-divergent* on the cyclic-period flag under 1D-CP token sharding.
+
+    The token axis is split into two chains: the first ``n_tokens // 2`` tokens
+    form a non-cyclic chain (``cyclic_period == 0``) and the second half a
+    cyclic chain (``cyclic_period == cyclic_period_val``).  With contiguous
+    token sharding along the cp axis (``Shard(1)``), a low cp rank holds only
+    first-half tokens, so its local ``torch.any(cyclic_period_local > 0)`` is
+    ``False`` while a high rank evaluates ``True``.
+
+    This is the precise condition that deadlocks a per-shard-gated collective:
+    if the decision to enter the column ``all_gather`` of ``cyclic_period`` is
+    taken independently per rank, the low ranks skip while the high ranks enter
+    and NCCL hangs.  The fix broadcasts the decision with a scalar
+    ``all_reduce(MAX)`` so every rank enters or skips in lockstep.  Crafting the
+    layout here — rather than relying on ``random_features`` (which sets every
+    ``cyclic_period`` token positive, making the flag uniformly ``True`` on all
+    ranks) — is what makes this *class* of bug (collective entry gated on
+    per-shard data) impossible to slip through a parity test.
+
+    ``cyclic_period_val`` must be chosen small relative to the within-chain
+    residue-index span so that the cyclic correction
+    ``d - period * round(d / period)`` is non-trivial for some same-chain pairs;
+    otherwise the cyclic branch, even when entered, is a no-op and the parity
+    assertion becomes vacuous.
+
+    Randomization (``rng`` provided): only the structural backbone that *creates
+    the rank divergence* is fixed — the two-chain ``asym_id`` split and the
+    ``cyclic_period`` layout (chain A exactly ``0`` so a low rank's shard is
+    genuinely all-zero → divergent branch triggered; chain B exactly
+    ``cyclic_period_val``).  Everything else (``residue_index``, ``token_index``,
+    ``sym_id``, ``entity_id``) is drawn from a realistic random distribution via
+    the supplied ``torch.Generator`` rather than left all-zero/sequential, so the
+    test exercises a non-degenerate feature distribution (per CLAUDE.md: avoid
+    all-zero inputs that can mask bugs).  ``residue_index`` is drawn from a range
+    well above ``cyclic_period_val`` so the cyclic correction stays non-trivial.
+    With ``rng=None`` the legacy deterministic backbone is used.
+
+    Parameters
+    ----------
+    size_batch : int
+        Batch dimension ``B``.
+    n_tokens : int
+        Token count ``N``.  Must be even so the two chains are balanced; the
+        caller is responsible for ``N % cp_size == 0`` (the data-pipeline
+        even-sharding invariant).
+    cyclic_period_val : int
+        Cyclic period assigned to the second-half (cyclic) chain.  Default 3.
+    rng : Optional[torch.Generator]
+        Local generator for contained randomization of the non-trigger features.
+        If ``None``, the features use a deterministic (sequential/zero) backbone.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        ``asym_id``, ``entity_id``, ``residue_index``, ``token_index``,
+        ``sym_id``, ``cyclic_period``, each shape ``(size_batch, n_tokens)``
+        and dtype ``torch.long``.
+    """
+    if n_tokens % 2 != 0:
+        raise ValueError(f"n_tokens ({n_tokens}) must be even to split into two balanced chains")
+    half = n_tokens // 2
+
+    # Structural backbone (FIXED — this is what makes the layout rank-divergent):
+    # a two-chain asym_id split, and cyclic_period exactly 0 on chain A / exactly
+    # cyclic_period_val on chain B. Chain A's all-zero cyclic_period is the
+    # intentional structural zero that triggers the divergent-entry branch on a
+    # low cp rank; do NOT randomize it.
+    asym_id = torch.zeros(size_batch, n_tokens, dtype=torch.long)
+    asym_id[:, half:] = 1
+    cyclic_period = torch.zeros(size_batch, n_tokens, dtype=torch.long)
+    cyclic_period[:, half:] = cyclic_period_val
+
+    if rng is None:
+        # Legacy deterministic backbone.
+        entity_id = asym_id.clone()
+        sym_id = torch.zeros(size_batch, n_tokens, dtype=torch.long)
+        residue_index = torch.zeros(size_batch, n_tokens, dtype=torch.long)
+        residue_index[:, :half] = torch.arange(half, dtype=torch.long)
+        residue_index[:, half:] = torch.arange(n_tokens - half, dtype=torch.long)
+        token_index = torch.arange(n_tokens, dtype=torch.long).expand(size_batch, n_tokens).clone()
+    else:
+        # Randomize the non-trigger features with a contained generator. The
+        # residue-index range (>> cyclic_period_val) keeps the cyclic correction
+        # non-trivial for some same-chain pairs. entity_id is drawn per chain so
+        # ``b_same_entity`` stays a meaningful (non-uniform) relation.
+        res_hi = max(4 * cyclic_period_val, 32)
+        residue_index = torch.randint(0, res_hi, (size_batch, n_tokens), generator=rng, dtype=torch.long)
+        token_index = torch.randint(0, res_hi, (size_batch, n_tokens), generator=rng, dtype=torch.long)
+        sym_id = torch.randint(0, 4, (size_batch, n_tokens), generator=rng, dtype=torch.long)
+        # Per-chain random entity ids (constant within each chain, possibly equal
+        # or distinct across the two chains depending on the draw).
+        entity_id = torch.empty(size_batch, n_tokens, dtype=torch.long)
+        ent_a = torch.randint(0, 5, (size_batch, 1), generator=rng, dtype=torch.long)
+        ent_b = torch.randint(0, 5, (size_batch, 1), generator=rng, dtype=torch.long)
+        entity_id[:, :half] = ent_a
+        entity_id[:, half:] = ent_b
+
+    return {
+        "asym_id": asym_id,
+        "entity_id": entity_id,
+        "residue_index": residue_index,
+        "token_index": token_index,
+        "sym_id": sym_id,
+        "cyclic_period": cyclic_period,
+    }

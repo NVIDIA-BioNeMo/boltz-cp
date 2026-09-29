@@ -62,7 +62,9 @@ try:
     from trifast.torch import triangle_attention_bwd as trifast_triangle_attention_bwd
 
     trifast_is_installed = True
-except ImportError:
+except (ImportError, RuntimeError):
+    # RuntimeError: trifast calls torch.cuda.get_device_capability() at import
+    # time, which raises RuntimeError when no CUDA GPUs are available.
     trifast_is_installed = False
 
 

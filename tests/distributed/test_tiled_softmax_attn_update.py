@@ -44,14 +44,22 @@ def expected_accum(a, v, dim_softmax, return_amax: bool = True):
         return lse.to(dtype_input), o.reshape_as(lse).to(dtype_input), None
 
 
-@pytest.fixture
-def softmax_test_tensors():
+@pytest.fixture(
+    params=[
+        pytest.param((3, 21, torch.float32), id="length:63-dtype:float32"),
+        pytest.param((32, 32, torch.float32), id="length:1024-dtype:float32"),
+        pytest.param((32, 32, torch.bfloat16), id="length:1024-dtype:bfloat16"),
+        pytest.param((256, 32, torch.float32), id="length:8192-dtype:float32"),
+        pytest.param((256, 32, torch.bfloat16), id="length:8192-dtype:bfloat16"),
+        pytest.param((1024, 32, torch.float32), id="length:32768-dtype:float32"),
+        pytest.param((1024, 32, torch.bfloat16), id="length:32768-dtype:bfloat16"),
+    ]
+)
+def softmax_test_tensors(request):
     """Fixture providing test tensors for online softmax accumulation tests."""
     torch.manual_seed(42)
-    dtype = torch.float32
 
-    size_chunk = 3
-    n_chunks = 21
+    size_chunk, n_chunks, dtype = request.param
 
     n_elems = size_chunk * n_chunks
     size_batch = 3
@@ -146,6 +154,11 @@ def test_tiled_softmax_attention_update_correctness(softmax_test_tensors, has_am
     lse_m, o = None, None
     amax = None
 
+    # BF16 recurrence states are requantized after every tile. These absolute
+    # bounds match the long-context error budget against the FP64 oracle.
+    lse_tolerance = {"atol": 1.0, "rtol": 0.0} if a.dtype == torch.bfloat16 else {}
+    o_tolerance = {"atol": 5.0e-2, "rtol": 0.0} if a.dtype == torch.bfloat16 else {}
+
     for i_chunk in range(n_chunks):
         i_begin = i_chunk * size_chunk
         i_end = (i_chunk + 1) * size_chunk
@@ -183,8 +196,8 @@ def test_tiled_softmax_attention_update_correctness(softmax_test_tensors, has_am
         o, lse_m, amax = tiled_softmax_attention_update(o_chunk, lse_m_chunk, amax_chunk, o, lse_m, amax)
 
         # Verify correctness against expected results
-        torch.testing.assert_close(lse_m, lse_m_cum_expected)
-        torch.testing.assert_close(o, o_cum_expected)
+        torch.testing.assert_close(lse_m, lse_m_cum_expected, **lse_tolerance)
+        torch.testing.assert_close(o, o_cum_expected, **o_tolerance)
         if has_amax:
             torch.testing.assert_close(amax, amax_cum_expected)
         else:

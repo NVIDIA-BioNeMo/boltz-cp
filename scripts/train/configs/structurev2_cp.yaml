@@ -13,11 +13,15 @@ trainer:
   num_nodes: 1        # must be 1; multi-node is handled by torchrun/SLURM
   precision: null     # superseded by top-level precision below
 
+# CP topology: "1d" or "2d".
+# - 1d: flat CP group; size_cp can be any positive integer.
+# - 2d: square CP mesh; size_cp must be a perfect square (e.g. 1, 4, 9, 16).
+cp_topology: "2d"
+
 # Context-parallelism and data-parallelism topology.
 # Override via CLI: parallel_size.size_cp=4 parallel_size.size_dp=2
-# Constraint: size_cp must be a perfect square (2D CP mesh); size_dp * size_cp == world_size.
 parallel_size:
-  size_cp: 1          # context-parallel group size (must be a perfect square, e.g. 1, 4, 9, 16)
+  size_cp: 1          # context-parallel group size
   size_dp: 1          # data-parallel group size
   timeout_nccl: 30    # NCCL timeout in minutes (for CUDA)
   timeout_gloo: 30    # Gloo timeout in minutes (for CPU)

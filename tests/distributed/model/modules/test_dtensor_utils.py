@@ -21,7 +21,6 @@
 
 """Unit tests for DTensor checkpoint conversion helpers."""
 
-import socket
 from collections import OrderedDict
 
 import pytest
@@ -43,12 +42,7 @@ from boltz.distributed.model.modules.utils import (
     has_dtensors,
 )
 from boltz.testing.utils import create_boltz2_model_init_params, spawn_multiprocessing
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+from tests.distributed.model.modules._test_utils import _find_free_port
 
 
 @pytest.fixture

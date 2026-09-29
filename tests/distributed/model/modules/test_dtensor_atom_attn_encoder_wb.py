@@ -445,6 +445,14 @@ def parallel_assert_atom_attention_encoder_wb(
         for x in params_test
     ],
 )
+# adversarial_mask: when True, invalidate trailing atoms so the global valid count is
+# (W // 2) mod W -- a half-filled last query window. random_features() emits all-valid
+# masks, which keep total_valid a whole multiple of W and never exercise a partially-filled
+# boundary window; the all-valid path is vacuous for the 1D-CP window-batching boundary
+# behavior (the per-shard pack/repartition only differs from serial when the last real
+# window is partial). The adversarial mask forces that partial-boundary case so the test
+# can catch any cp-vs-serial divergence in the windowed AtomAttentionEncoder.
+@pytest.mark.parametrize("adversarial_mask", [False, True], ids=["allvalid", "adversarial_halfwindow"])
 # TODO: Add "boltz1" to serial_module_version to test the V1 internalized_AtomEncoder path.
 # Requirements for boltz1 test:
 #   - V1 serial AtomAttentionEncoder (monolithic: embed + pair + r_to_q + transformer + scatter)
@@ -454,7 +462,9 @@ def parallel_assert_atom_attention_encoder_wb(
 #   - V1 returns 5 values: (a, q, c, p, to_keys) vs V2's 4: (a, q, c, to_keys)
 #   - The DTensor path exercises _atom_encoder() shared function through the V1 code path
 @pytest.mark.parametrize("serial_module_version", ["boltz2"])
-def test_atom_attention_encoder_window_batching(setup_env, dtype, multiplicity, serial_module_version):
+def test_atom_attention_encoder_window_batching(
+    setup_env, dtype, multiplicity, serial_module_version, adversarial_mask
+):
     """Test DTensor AtomAttentionEncoder with window batching."""
     grid_group_sizes, world_size, device_type, backend, _, env_per_rank = setup_env
 
@@ -515,6 +525,36 @@ def test_atom_attention_encoder_window_batching(setup_env, dtype, multiplicity, 
 
     N_atoms_actual = feats["atom_pad_mask"].shape[1]
     K = N_atoms_actual // W
+
+    if adversarial_mask:
+        # Force the global valid-atom count to (W // 2) mod W so the last real query window is
+        # exactly half-filled -- the partial-boundary case random_features never produces. We
+        # invalidate the globally-trailing atoms (the tail of the last CP shard) by zeroing every
+        # coupled validity/mapping feature. Serial token aggregation is gated by zero rows in
+        # atom_to_token, while the distributed path also uses atom_pad_mask for packing.
+        # target_valid sits below N_atoms_actual so only trailing pad/real atoms are dropped,
+        # never a whole rank's worth.
+        target_valid = ((N_atoms_actual // W) - 1) * W + W // 2
+        assert (
+            0 < target_valid < N_atoms_actual
+        ), f"adversarial target_valid={target_valid} out of range for N_atoms_actual={N_atoms_actual}"
+        adv_mask = torch.zeros_like(feats["atom_pad_mask"])
+        adv_mask[:, :target_valid] = 1
+        feats["atom_pad_mask"] = adv_mask.to(feats["atom_pad_mask"].dtype)
+        feats["atom_to_token"] = feats["atom_to_token"].masked_fill(
+            ~adv_mask.bool().unsqueeze(-1),
+            0,
+        )
+        feats["atom_counts_per_token"] = feats["atom_to_token"].sum(dim=1).to(feats["atom_counts_per_token"].dtype)
+
+    assert torch.equal(
+        feats["atom_to_token"].sum(dim=-1).bool(),
+        feats["atom_pad_mask"].bool(),
+    )
+    assert torch.equal(
+        feats["atom_to_token"].sum(dim=1).to(feats["atom_counts_per_token"].dtype),
+        feats["atom_counts_per_token"],
+    )
 
     # Build serial modules
     # For Boltz-2, p last dim = num_heads * depth (pre-computed bias split for DiffusionTransformer)

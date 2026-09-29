@@ -10,13 +10,13 @@ description: >
   against the serial forward+backward via the test skill. Use when porting a
   custom model's trunk / attention / triangle / OPM / diffusion / confidence /
   loss modules to CP.
-argument-hint: "[module name] [2d]"
+argument-hint: "[module name] [1d | 2d]"
 ---
 
 # dtensor_modules — port a serial module to context parallelism
 
 The serial module is the mathematical specification. The CP version must produce
-numerically equivalent forward+backward while holding only its O(N/cp0) (single) or
+numerically equivalent forward+backward while holding only its O(N/cp) (single) or
 O(N²/(cp0·cp1)) (pair) shard. The serial→CP dictionary with all I/O placements,
 collectives, and backward budgets is in [module_map.md](module_map.md) — **look up
 the target there first.**
@@ -25,14 +25,14 @@ the target there first.**
 
 - `docs/current_code_structure.md` §4 (module map) names the target's serial
   block and its CP-candidate status (reuse / adapt / new).
-- `docs/cp_infra.md` gives the 2D mesh and `world_size`.
+- `docs/cp_infra.md` gives the topology (`1d`/`2d`) and `world_size`.
 - The features the module consumes are (or will be) produced by
   `/fold-cp:shard_data_feats` at known placements.
 - Tech guide section for the target (see [module_map.md](module_map.md)).
 
 ## Step 1 — Look up the contract
 
-In [module_map.md](module_map.md) find the target's row: serial file, 2D CP
+In [module_map.md](module_map.md) find the target's row: serial file, 2D/1D CP
 file, tech guide §, **input placements**, **output placements**, **collectives**,
 and **backward memory budget**. If the target is in the substrate-primitive
 catalog, prefer composing it from those utilities over writing a new

@@ -46,6 +46,7 @@ from boltz.data.tokenize.boltz import BoltzTokenizer
 from boltz.data.types import Input, Manifest, Target, Tokenized
 from boltz.distributed.data.types import PairMaskMode
 from boltz.distributed.manager import DistributedManager
+from boltz.distributed.port_utils import find_free_port
 from boltz.main import (
     MOL_URL,
     BoltzDiffusionParams,
@@ -244,12 +245,22 @@ def setup_env(request, monkeypatch):
         monkeypatch.delenv("SLURM_LOCALID", raising=False)
     if method_init == "ENV":
         monkeypatch.setenv("MASTER_ADDR", "localhost")
-        monkeypatch.setenv("MASTER_PORT", "29500")
+        # Allocate a free port per fixture invocation so concurrent pytest
+        # runs (e.g. parallel worktrees) do not collide on a fixed default.
+        # spawn_multiprocessing refreshes fixture-owned ports immediately before
+        # launch and retries one exact TCPStore EADDRINUSE race.
+        monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
+        monkeypatch.setenv("BOLTZ_TEST_DYNAMIC_MASTER_PORT", "1")
         monkeypatch.setenv("WORLD_SIZE", f"{world_size}")
         env_per_rank = {"RANK": "<INPUT_RANK>", "LOCAL_RANK": "<INPUT_RANK>"}
     elif method_init == "SLURM":
         monkeypatch.setenv("SLURM_LAUNCH_NODE_IPADDR", "localhost")
         monkeypatch.setenv("SLURM_NPROCS", f"{world_size}")
+        # SLURM jobscript convention: parent exports MASTER_PORT once and all
+        # ranks read it from env. Without this, each rank's find_free_port()
+        # picks a different port and rendezvous deadlocks at cp>=2.
+        monkeypatch.setenv("MASTER_PORT", str(find_free_port()))
+        monkeypatch.setenv("BOLTZ_TEST_DYNAMIC_MASTER_PORT", "1")
         env_per_rank = {"SLURM_PROCID": "<INPUT_RANK>", "SLURM_LOCALID": "<INPUT_RANK>"}
     backend = DistributedManager.backend_for_device()[device_type]
     grid_group_sizes = OrderedDict(dp=n_procs_dp, cp=n_procs_cp)

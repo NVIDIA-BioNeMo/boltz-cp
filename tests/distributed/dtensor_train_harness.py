@@ -27,17 +27,46 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 import torch
-from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Placement, Replicate, Shard, distribute_tensor
 from torch.utils.data import DataLoader, Dataset
 
 from boltz.distributed.comm import TransposeComm
 from boltz.distributed.manager import DistributedManager
-from boltz.distributed.model.loss.distogram import distogram_loss as distogram_loss_dtensor
+from boltz.distributed.model.loss.distogram import distogram_loss as distogram_loss_2d
+from boltz.distributed.model.loss.distogram_1d import distogram_loss_1d
+from boltz.distributed.model.models.boltz2_1d import _DistogramModule1D
 from boltz.distributed.model.modules.trunkv2 import DistogramModule as DistogramModuleDTensor
 from boltz.distributed.model.optim.ema import DistributedEMA
 from boltz.model.loss.distogramv2 import distogram_loss as distogram_loss_serial
 from boltz.model.modules.trunkv2 import DistogramModule as SerialDistogramModule
 from boltz.testing.utils import init_module_params_uniform
+
+
+def _cp_mesh_and_placements(
+    manager: DistributedManager,
+    *,
+    replicate_last: bool = False,
+) -> tuple[DeviceMesh, tuple[Placement, ...]]:
+    """Return (device_mesh, placements) for the active CP topology.
+
+    - 2D CP (subgroups populated): mesh is the 3-axis
+      ``(dp, cp_axis_0, cp_axis_1)`` mesh; placements are
+      ``(Shard(0), Shard(1), Shard(2))`` for the data tensors and
+      ``(Shard(0), Shard(1), Replicate())`` for the mask.
+    - 1D CP (subgroups is None): mesh is the 2-axis ``(dp, cp)`` mesh;
+      placements are ``(Shard(0), Shard(1))`` for data and
+      ``(Shard(0), Replicate())`` for the mask.
+    """
+    if manager.device_mesh_subgroups is not None:
+        mesh = manager.device_mesh_subgroups
+        if replicate_last:
+            return mesh, (Shard(0), Shard(1), Replicate())
+        return mesh, (Shard(0), Shard(1), Shard(2))
+    mesh = manager.device_mesh
+    if replicate_last:
+        return mesh, (Shard(0), Replicate())
+    return mesh, (Shard(0), Shard(1))
 
 
 class SyntheticDistogramDataset(Dataset):
@@ -104,12 +133,24 @@ class TinyDistogramCPModel(pl.LightningModule):
         )
         serial_module.load_state_dict(serial_state_dict)
         serial_module.to(dist_manager.device)  # Must be on mesh device before DTensor wrapping
-        self.loss_comm = TransposeComm(dist_manager.group["cp"], dist_manager.layout_subgroups["cp"])
-        self.distogram_module = DistogramModuleDTensor(
-            module=serial_module,
-            dist_manager=dist_manager,
-            distogram_comm=self.loss_comm,
-        )
+        if dist_manager.device_mesh_subgroups is not None:
+            # 2D CP: use TransposeComm-based distogram module and loss.
+            self.loss_comm: TransposeComm | None = TransposeComm(
+                dist_manager.group["cp"], dist_manager.layout_subgroups["cp"]
+            )
+            self.distogram_module = DistogramModuleDTensor(
+                module=serial_module,
+                dist_manager=dist_manager,
+                distogram_comm=self.loss_comm,
+            )
+        else:
+            # 1D CP: no TransposeComm; use the all-to-all-based 1D module.
+            self.loss_comm = None
+            self.distogram_module = _DistogramModule1D(
+                module=serial_module,
+                device_mesh=dist_manager.device_mesh,
+                cp_group=dist_manager.group["cp"],
+            )
 
     def on_train_start(self) -> None:
         # Loss log keyed by (epoch, batch_idx) for stop/go trajectory comparison.
@@ -147,23 +188,16 @@ class TinyDistogramCPModel(pl.LightningModule):
         target = batch["target"].to(self.dist_manager.device)
         mask = batch["mask"].to(self.dist_manager.device)
 
-        # Mesh dims: (dp, cp_row, cp_col).  Shard(0) splits the batch across
-        # dp ranks; DataLoader supplies global batch (micro_batch * dp_size).
-        z_dtensor = distribute_tensor(
-            z,
-            device_mesh=self.dist_manager.device_mesh_subgroups,
-            placements=(Shard(0), Shard(1), Shard(2)),
-        )
-        target_dtensor = distribute_tensor(
-            target,
-            device_mesh=self.dist_manager.device_mesh_subgroups,
-            placements=(Shard(0), Shard(1), Shard(2)),
-        )
-        mask_dtensor = distribute_tensor(
-            mask,
-            device_mesh=self.dist_manager.device_mesh_subgroups,
-            placements=(Shard(0), Shard(1), Replicate()),
-        )
+        data_mesh, data_placements = _cp_mesh_and_placements(self.dist_manager)
+        # 2D CP: mask is (Shard(0), Shard(1), Replicate()) — replicated over cp_axis_1.
+        # 1D CP: mask must be (Shard(0), Shard(1)) — sharded over both dp and cp.
+        if self.loss_comm is not None:
+            mask_mesh, mask_placements = _cp_mesh_and_placements(self.dist_manager, replicate_last=True)
+        else:
+            mask_mesh, mask_placements = data_mesh, data_placements
+        z_dtensor = distribute_tensor(z, device_mesh=data_mesh, placements=data_placements)
+        target_dtensor = distribute_tensor(target, device_mesh=data_mesh, placements=data_placements)
+        mask_dtensor = distribute_tensor(mask, device_mesh=mask_mesh, placements=mask_placements)
 
         # Verify DTensor sharding is active — proves CP is real, not silently
         # replicated.  Each mesh dim shrinks the corresponding tensor dim.
@@ -172,12 +206,24 @@ class TinyDistogramCPModel(pl.LightningModule):
         pred_dtensor = self.distogram_module(z_dtensor)
         # Capture local output for tests without altering Trainer internals.
         self.last_pred_local = pred_dtensor.to_local().detach().cpu()
-        global_loss_dtensor, _ = distogram_loss_dtensor(
-            {"pdistogram": pred_dtensor},
-            {"disto_target": target_dtensor, "token_disto_mask": mask_dtensor},
-            self.loss_comm,
-            aggregate_distogram=False,
-        )
+        if self.loss_comm is not None:
+            # 2D CP loss path.
+            global_loss_dtensor, _ = distogram_loss_2d(
+                {"pdistogram": pred_dtensor},
+                {"disto_target": target_dtensor, "token_disto_mask": mask_dtensor},
+                self.loss_comm,
+                aggregate_distogram=False,
+            )
+        else:
+            # 1D CP loss path.
+            global_loss_dtensor, _ = distogram_loss_1d(
+                {"pdistogram": pred_dtensor},
+                {"disto_target": target_dtensor, "token_disto_mask": mask_dtensor},
+                device_mesh=self.dist_manager.device_mesh,
+                dp_group=self.dist_manager.group["dp"],
+                cp_group=self.dist_manager.group["cp"],
+                aggregate_distogram=False,
+            )
         loss = global_loss_dtensor.to_local()
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=False)
         self._loss_log[(self.current_epoch, batch_idx)] = loss.detach().item()

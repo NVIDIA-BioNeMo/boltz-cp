@@ -74,10 +74,12 @@ except ImportError:
 
 from boltz.data.module.trainingv2 import DataConfigV2
 from boltz.distributed.data.module.trainingv2 import Boltz2TrainingDataModule
-from boltz.distributed.data.utils import map_subgroup_mesh_to_cpu
+from boltz.distributed.data.module.trainingv2_1d import Boltz2TrainingDataModule1D
+from boltz.distributed.data.utils import map_mesh_to_cpu_1d, map_subgroup_mesh_to_cpu
 from boltz.distributed.lightning_strategy import BoltzContextParallelStrategy
 from boltz.distributed.manager import DistributedManager
 from boltz.distributed.model.models.boltz2 import Boltz2 as Boltz2Distributed
+from boltz.distributed.model.models.boltz2_1d import Boltz2_1D as Boltz2Distributed1D
 from boltz.distributed.model.modules.utils import (
     PRECISION_TO_LIGHTNING,
     OffloadActvCkptToCPU,
@@ -106,6 +108,7 @@ class DistributedTrainConfig:
     output: str
     trainer: Optional[dict[str, Any]] = None
     parallel_size: Optional[dict[str, Any]] = None
+    cp_topology: str = "2d"  # "1d" or "2d"; controls CP mesh shape and model wrapper
     precision: Precision = Precision.FP32
     matmul_precision: Optional[str] = None
     find_unused_parameters: Optional[bool] = False  # Retained for boltz-2 config compat; unused by CP strategy
@@ -255,13 +258,22 @@ def _create_dist_manager(cfg: DistributedTrainConfig) -> DistributedManager:
             f"expected size_dp*size_cp={size_dp * size_cp}"
         )
 
-    size_cp_axis = isqrt(size_cp)
-    if size_cp_axis * size_cp_axis != size_cp:
-        raise ValueError(f"size_cp must be a square integer for 2D CP mesh, got {size_cp}")
+    # Build the CP grid group based on topology.
+    # - 1D CP: ("cp", size_cp) creates a 2D device mesh (dp, cp).  Any positive
+    #   size_cp is valid (no square constraint).
+    # - 2D CP: ("cp", (sqrt, sqrt)) creates a 3D device mesh (dp, cp0, cp1).
+    #   size_cp must be a perfect square.
+    cp_topology = cfg.cp_topology
+    if cp_topology not in ("1d", "2d"):
+        raise ValueError(f"cp_topology must be '1d' or '2d', got {cp_topology!r}")
 
-    grid_group_sizes: OrderedDict[str, int | tuple[int, ...]] = OrderedDict(
-        [("dp", size_dp), ("cp", (size_cp_axis, size_cp_axis))]
-    )
+    if cp_topology == "1d":
+        grid_group_sizes: OrderedDict[str, int | tuple[int, ...]] = OrderedDict([("dp", size_dp), ("cp", size_cp)])
+    else:
+        size_cp_axis = isqrt(size_cp)
+        if size_cp_axis * size_cp_axis != size_cp:
+            raise ValueError(f"size_cp must be a perfect square for 2D CP mesh, got {size_cp}")
+        grid_group_sizes = OrderedDict([("dp", size_dp), ("cp", (size_cp_axis, size_cp_axis))])
     DistributedManager.create_grid_group(grid_group_sizes)
     return dist_manager
 
@@ -362,6 +374,7 @@ def _cleanup_distributed() -> None:
 def _create_distributed_data_module(
     data_config: Any,
     dist_manager: DistributedManager,
+    cp_topology: str = "2d",
 ) -> pl.LightningDataModule:
     """Construct the distributed Boltz-2 training data module.
 
@@ -376,11 +389,19 @@ def _create_distributed_data_module(
         OmegaConf/dict that can be unpacked into one.
     dist_manager
         Initialized :class:`DistributedManager` with grid groups.
+    cp_topology
+        ``"1d"`` or ``"2d"``.  Controls which device mesh and CPU mesh
+        are passed to the data module.
     """
     cfg = data_config if isinstance(data_config, DataConfigV2) else DataConfigV2(**data_config)
-    device_mesh = dist_manager.device_mesh_subgroups
-    device_mesh_cpu = map_subgroup_mesh_to_cpu(dist_manager)
-    return Boltz2TrainingDataModule(cfg=cfg, device_mesh=device_mesh, device_mesh_cpu=device_mesh_cpu)
+    if cp_topology == "1d":
+        device_mesh = dist_manager.device_mesh
+        device_mesh_cpu = map_mesh_to_cpu_1d(dist_manager)
+        return Boltz2TrainingDataModule1D(cfg=cfg, device_mesh=device_mesh, device_mesh_cpu=device_mesh_cpu)
+    else:
+        device_mesh = dist_manager.device_mesh_subgroups
+        device_mesh_cpu = map_subgroup_mesh_to_cpu(dist_manager)
+        return Boltz2TrainingDataModule(cfg=cfg, device_mesh=device_mesh, device_mesh_cpu=device_mesh_cpu)
 
 
 def _create_distributed_model(
@@ -390,7 +411,8 @@ def _create_distributed_model(
     """Construct the distributed Boltz-2 model with DTensor CP wrapping.
 
     Instantiates the serial model from config, loads pretrained weights if
-    requested, moves to device, and wraps with :class:`Boltz2Distributed`.
+    requested, moves to device, and wraps with :class:`Boltz2Distributed` (2D)
+    or :class:`Boltz2Distributed1D` (1D) depending on ``cfg.cp_topology``.
     Tests may monkeypatch this function to supply a lightweight DTensor-aware
     smoke model.
 
@@ -398,13 +420,22 @@ def _create_distributed_model(
     ----------
     cfg
         Full training configuration (model, pretrained, strict_loading, etc.).
+        ``cfg.cp_topology`` selects the model wrapper: ``"1d"`` uses
+        :class:`Boltz2_1D` on the 2D mesh ``(dp, cp)``; ``"2d"`` (default)
+        uses :class:`Boltz2` on the 3D subgroup mesh ``(dp, cp0, cp1)``.
     dist_manager
         Initialized :class:`DistributedManager` with grid groups.
     """
     model_serial = cfg.model
     model_serial = _load_pretrained_if_requested(model_serial, cfg)
     model_serial = model_serial.to(dist_manager.device)
-    dist_model = Boltz2Distributed(model_serial, dist_manager)
+    if cfg.cp_topology == "1d":
+        dist_model = Boltz2Distributed1D(
+            model_serial,
+            dist_manager=dist_manager,
+        )
+    else:
+        dist_model = Boltz2Distributed(model_serial, dist_manager)
     if not cfg.strict_loading:
         dist_model.strict_loading = False
     return dist_model
@@ -474,7 +505,7 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912
     if cfg.debug:
         wandb_cfg = None
 
-    data_module = _create_distributed_data_module(cfg.data, dist_manager)
+    data_module = _create_distributed_data_module(cfg.data, dist_manager, cp_topology=cfg.cp_topology)
     model_module = _create_distributed_model(cfg, dist_manager)
 
     model_module.apply(SetTriAttnBackend(cfg.triattn_backend))

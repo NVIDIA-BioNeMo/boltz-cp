@@ -12,7 +12,8 @@
 | Tech guide | `${CLAUDE_PLUGIN_ROOT}/reference/cp_tech_guide.md` (bundled in the fold-cp plugin) |
 | Distributed code to mirror | `<BOLTZ_CP_REPO>/src/boltz/distributed/` |
 | Governing rules | fold-cp `hooks/RULES.md` (injected at SessionStart) |
-| Target CP topology | `2d` (perfect-square mesh) |
+| Target CP topology | `2d` (supported, default) / `1d` (EXPERIMENTAL — at-own-risk sign-off required, Rule 25) |
+| 1D-CP risk sign-off | `n/a (2D)` — or, if `1d`: `acknowledged at-own-risk by <user> on <date>` (Rule 25) |
 | Serial ground-truth paths | `<glob>`, … (read-only — Rule 2) |
 
 ## 1. Inference workflow
@@ -42,34 +43,34 @@
 
 One row per feature reaching `forward`. Axis semantics drive sharding.
 
-| Feature name | Shape | Dtype | Axis semantics | Index/mask notes | Proposed 2D placement |
+| Feature name | Shape | Dtype | Axis semantics | Index/mask notes | Proposed placement (2D / 1D) |
 |---|---|---|---|---|---|
-| `<token_feat>` | `[B, N, C]` | `f32` | tokens=dim1 | — | `(S(0),R)` |
-| `<pair_feat>` | `[B, N, N, C]` | `f32` | pair=dims1,2 | — | `(S(0),S(1))` |
-| `<msa_feat>` | `[B, S, N, C]` | `f32` | msa=dim1, tokens=dim2 | — | `(S(1),R)` |
-| `<atom_feat>` | `[B, N_atoms, C]` | `f32` | atoms=dim1 | local idx? | `(S(0),R)` |
+| `<token_feat>` | `[B, N, C]` | `f32` | tokens=dim1 | — | `(S(0),R)` / `(S(0),)` |
+| `<pair_feat>` | `[B, N, N, C]` | `f32` | pair=dims1,2 | — | `(S(0),S(1))` / `(S(0),)` |
+| `<msa_feat>` | `[B, S, N, C]` | `f32` | msa=dim1, tokens=dim2 | — | `(S(1),R)` / `(S(1),)` |
+| `<atom_feat>` | `[B, N_atoms, C]` | `f32` | atoms=dim1 | local idx? | `(S(0),R)` / `(S(0),)` |
 | `<atom_to_token>` | `[B, N_atoms, N]` | `i64` | atoms=dim1, tokens=dim2 | global idx | … |
 
 Placement shorthand: `S(d)`=`Shard(d)`, `R`=`Replicate()`. 2D sub-mesh is
-`(cp0, cp1)`. DP is added later by the collate step.
+`(cp0, cp1)`; 1D sub-mesh is `(cp,)`. DP is added later by the collate step.
 
 **Ambiguities resolved:** `<e.g. N_tokens vs N_atoms; padding multiple; mask
 polarity>`
 
 **Auxiliary features & index mapping:** inventory **auxiliary features** (masks, biases,
 frame/relpos/atom indices) alongside the primary token/pair/atom features, and label each index as
-**local** (`0..N/cp0−1`) or **global** (`0..N−1`) — the model and data pipeline must agree.
+**local** (`0..N/cp−1`) or **global** (`0..N−1`) — the model and data pipeline must agree.
 
 ## 4. Module map: serial → Boltz-CP
 
-| Serial block (file:class) | Math role | Boltz-CP candidate (2D file) | Tech guide § | Status |
+| Serial block (file:class) | Math role | Boltz-CP candidate (2D file / 1D file) | Tech guide § | Status |
 |---|---|---|---|---|
-| `<trunk.Pairformer>` | pair+single updates | `layers/pairformer.py` | §3–§8 | adapt |
-| `<...TriangleMult>` | pair→pair | `layers/triangular_mult.py` | §4 | reuse |
-| `<...OuterProductMean>` | single→pair | `layers/outer_product_mean.py` | §6 | reuse |
-| `<...AtomEncoder>` | token↔atom, windows | `modules/encoders.py` (+ §9 gather) | §9 | adapt |
-| `<...Diffusion>` | structure head | `modules/diffusion.py` | — | new? |
-| `<...Confidence>` | pLDDT/PAE | `modules/confidencev2.py` | §10 | adapt |
+| `<trunk.Pairformer>` | pair+single updates | `layers/pairformer.py` / `pairformer_1d.py` | §3–§8 | adapt |
+| `<...TriangleMult>` | pair→pair | `layers/triangular_mult.py` / `_1d.py` | §4 | reuse |
+| `<...OuterProductMean>` | single→pair | `layers/outer_product_mean.py` / `_1d.py` | §6 | reuse |
+| `<...AtomEncoder>` | token↔atom, windows | `modules/encoders.py` / `_1d.py` (+ §9 gather) | §9 | adapt |
+| `<...Diffusion>` | structure head | `modules/diffusion.py` / `_1d.py` | — | new? |
+| `<...Confidence>` | pLDDT/PAE | `modules/confidencev2.py` / `confidence_1d.py` | §10 | adapt |
 
 Status ∈ {reuse as-is, adapt, new}. Every **new** row is work for
 `/fold-cp:dtensor_modules`.
@@ -80,10 +81,10 @@ The single sharding requirement every consuming CP module **and** the synthetic 
 data/featurizer must honor. Derive it **once** here (propagate §3 placements to §4 consumers) so a
 module port wires against a known contract instead of re-reconciling the same seam.
 
-| Data feature (§3) | Required 2D placement | Consumed by (modules, §4) | Co-shard / seam notes |
+| Data feature (§3) | Required placement (2D / 1D) | Consumed by (modules, §4) | Co-shard / seam notes |
 |---|---|---|---|
-| `<pair>` | `(S(0),S(1))` | tri-mult, tri-attn, OPM(out), PWA, attn-pair-bias | square tile; both N axes co-sharded |
-| `<msa>` | `(S(0)=depth, S(1)=tokens)` | OPM, PWA, MSA module | **one contract for all 3 — propagate, don't re-derive per module** |
+| `<pair>` | `(S(0),S(1))` / `(S(0),)` | tri-mult, tri-attn, OPM(out), PWA, attn-pair-bias | square tile; both N axes co-sharded |
+| `<msa>` | `(S(0)=depth, S(1)=tokens)` / `(S(0),)` | OPM, PWA, MSA module | **one contract for all 3 — propagate, don't re-derive per module** |
 | `<atom_to_token>` | `(S(0),R)` + global-index remap | atom encoder/decoder, scatter | co-shard atoms with their tokens (Rule 8) |
 | `<token_single>` | `(S(0),R)` | relpos, attn-pair-bias, transition, … | — |
 

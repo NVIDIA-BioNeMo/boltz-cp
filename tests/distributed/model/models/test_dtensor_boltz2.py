@@ -312,7 +312,7 @@ def _create_minimal_serial_boltz2(
     training_args = _make_training_args()
     validation_args = _make_validation_args()
 
-    pairformer_args = {"num_blocks": 1, "num_heads": 2, "dropout": 0.0}
+    pairformer_args = {"num_blocks": 1, "num_heads": 2, "dropout": 0.0, "v2": True}
 
     model = SerialBoltz2(
         atom_s=16,

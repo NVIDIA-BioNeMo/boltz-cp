@@ -30,7 +30,6 @@ Tests:
     spill registers.
 """
 
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -39,6 +38,7 @@ import pytest
 import torch
 
 from boltz.distributed.model.loss.triton.clash_denom import clash_denom_grouped
+from tests.distributed.model.loss.triton_test_utils import get_triton_ptxas_path
 
 # ---------------------------------------------------------------------------
 # Reference implementation
@@ -195,7 +195,7 @@ def assert_no_register_spilling(path_to_ptx_file: Path):
         raise RuntimeError(f"No .target directive found in {path_to_ptx_file}")
     sm_arch = sm_arch_match.group(1)
 
-    ptxas_path = os.environ.get("TRITON_PTXAS_PATH", "ptxas")
+    ptxas_path = get_triton_ptxas_path(sm_arch)
     cmd = [ptxas_path, "-v", f"--gpu-name={sm_arch}", str(path_to_ptx_file)]
 
     try:
@@ -213,8 +213,6 @@ def test_no_register_spilling(tmp_path, monkeypatch):
     monkeypatch.setenv("TRITON_DUMP_DIR", str(tmp_path))
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("TRITON_PTXAS_PATH", os.environ.get("TRITON_PTXAS_PATH", "ptxas"))
-
     device = torch.device("cuda")
     # mul=16 must differ from correctness-test values (1, 4) so Triton
     # compiles a fresh kernel specialisation and dumps PTX to tmp_path.

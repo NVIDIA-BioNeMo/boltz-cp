@@ -36,6 +36,44 @@ from boltz.distributed.model.modules.utils import validate_window_batching_param
 from boltz.distributed.utils import update_exhaustive_strides
 
 
+def _ring_p2p_send_recv(
+    sends: list[torch.Tensor],
+    recvs: list[torch.Tensor],
+    send_to: int,
+    recv_from: int,
+    group: dist.ProcessGroup,
+    parity: bool,
+) -> list:
+    """Issue async P2P send+recv for one or more tensor pairs.
+
+    All send/recv operations are batched into a single ``batch_isend_irecv``
+    call to avoid gloo backend issues with concurrent P2P dispatches from
+    the same ranks.
+
+    Returns an empty list for self-communication (cp_size=1).  The caller
+    must call ``w.wait()`` on each handle before reading recvs.
+    """
+    assert len(sends) == len(recvs), f"sends/recvs length mismatch: {len(sends)} vs {len(recvs)}"
+    rank = dist.get_rank(group)
+    if send_to == rank and recv_from == rank:
+        for s, r in zip(sends, recvs):
+            r.copy_(s)
+        return []
+
+    send_to_global = dist.get_global_rank(group, send_to)
+    recv_from_global = dist.get_global_rank(group, recv_from)
+
+    ops = []
+    for s, r in zip(sends, recvs):
+        if parity:
+            ops.append(dist.P2POp(dist.isend, s, send_to_global, group=group))
+            ops.append(dist.P2POp(dist.irecv, r, recv_from_global, group=group))
+        else:
+            ops.append(dist.P2POp(dist.irecv, r, recv_from_global, group=group))
+            ops.append(dist.P2POp(dist.isend, s, send_to_global, group=group))
+    return dist.batch_isend_irecv(ops)
+
+
 def get_query_window_key_range(W: int, H: int, K: int, ids_query_window: torch.Tensor) -> torch.Tensor:
     """
     Get the range of half-window indices (j) that query windows attend to.

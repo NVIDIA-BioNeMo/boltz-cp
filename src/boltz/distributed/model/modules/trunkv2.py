@@ -220,21 +220,46 @@ class InputEmbedder(nn.Module):
         # Token-level embedding: sum of atom attention output + learned projections
         profile_cat = shardwise_cat([profile, deletion_mean], dim=-1)
 
-        s = elementwise_op(a, self.res_type_encoding(res_type), ElementwiseOp.SUM)
-        s = elementwise_op(s, self.msa_profile_encoding(profile_cat), ElementwiseOp.SUM)
+        # Redistribute encoding outputs to match `a`'s placements.  The
+        # encoding inputs (res_type, profile_cat, etc.) may have different
+        # placements from `a` (e.g. Replicate on the token axis vs Shard),
+        # causing shape mismatches in elementwise_op.  redistribute is a
+        # no-op when placements already match.
+        s = elementwise_op(
+            a, self.res_type_encoding(res_type).redistribute(a.device_mesh, a.placements), ElementwiseOp.SUM
+        )
+        s = elementwise_op(
+            s, self.msa_profile_encoding(profile_cat).redistribute(s.device_mesh, s.placements), ElementwiseOp.SUM
+        )
 
         # Optional conditioning
         if self.add_method_conditioning:
-            s = elementwise_op(s, self.method_conditioning_init(feats["method_feature"]), ElementwiseOp.SUM)
+            s = elementwise_op(
+                s,
+                self.method_conditioning_init(feats["method_feature"]).redistribute(s.device_mesh, s.placements),
+                ElementwiseOp.SUM,
+            )
         if self.add_modified_flag:
-            s = elementwise_op(s, self.modified_conditioning_init(feats["modified"]), ElementwiseOp.SUM)
+            s = elementwise_op(
+                s,
+                self.modified_conditioning_init(feats["modified"]).redistribute(s.device_mesh, s.placements),
+                ElementwiseOp.SUM,
+            )
         if self.add_cyclic_flag:
             cyclic = feats["cyclic_period"].to(self.cyclic_conditioning_init.weight.dtype)
             cyclic = clip(cyclic, max_val=1.0)
             cyclic = shardwise_unsqueeze(cyclic, -1)
-            s = elementwise_op(s, self.cyclic_conditioning_init(cyclic), ElementwiseOp.SUM)
+            s = elementwise_op(
+                s,
+                self.cyclic_conditioning_init(cyclic).redistribute(s.device_mesh, s.placements),
+                ElementwiseOp.SUM,
+            )
         if self.add_mol_type_feat:
-            s = elementwise_op(s, self.mol_type_conditioning_init(feats["mol_type"]), ElementwiseOp.SUM)
+            s = elementwise_op(
+                s,
+                self.mol_type_conditioning_init(feats["mol_type"]).redistribute(s.device_mesh, s.placements),
+                ElementwiseOp.SUM,
+            )
 
         return s
 

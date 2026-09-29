@@ -6,15 +6,21 @@ and the exact forward/backward schedule.
 
 ## How to read placements
 
-- Sub-mesh only (DP omitted). **2D** = `(cp0, cp1)`.
+- Sub-mesh only (DP omitted). **2D** = `(cp0, cp1)`; **1D** = `(cp,)`.
 - `S(d)` = `Shard(d)` on **tensor** dim `d`; `R` = `Replicate`.
-- Single/token/atom `[N, C]`: `(S0, R)`. Per-rank O(N/cp0).
-- Pair `[N, N, C]`: `(S0, S1)` square tile O(N²/(cp0·cp1)).
-- MSA `[S, N, C]`: `(S1, R)`.
+- Single/token/atom `[N, C]`: 2D `(S0, R)`, 1D `(S0,)`. Per-rank O(N/cp).
+- Pair `[N, N, C]`: 2D `(S0, S1)` square tile O(N²/(cp0·cp1)); 1D `(S0,)` row-slab
+  O(N²/cp).
+- MSA `[S, N, C]`: 2D `(S1, R)`, 1D `(S1,)`.
 - **Backward per-rank memory must equal the forward budget** for the same tensor
   class (Rule 11). Saved-for-backward tensors that scale with full N or S are bugs.
 - **Every collective needs an equal per-rank buffer shape** (fold-cp Rule 8) — hence
   even shards (`shape[dim] % mesh_size == 0`) and the co-sharding requirement below.
+- **Derive placements from `mesh.ndim`, not literal tuples.** A helper like
+  `single_repr_placements(ndim)` / `pair_repr_placements(ndim)` returns the right placement for
+  1D (2-axis mesh) vs 2D (3-axis mesh) CP from **one** code path; every `from_local` and
+  placement assertion reads `mesh.ndim`, so the module serves both topologies without forked
+  per-topology literals (the structural core of a 1D↔2D "alignment audit").
 
 ## Substrate primitive catalog (no serial twin — these *are* the CP layer)
 
@@ -76,40 +82,41 @@ the *feature* level, not just the tensor level. The `outer_gather` row below is 
 
 ## Layer dictionary (tech guide §3–§9)
 
-| Module | Serial role | 2D file | § | In → Out placement | Collectives | Bwd budget |
-|---|---|---|---|---|---|---|
-| Triangle Mult (out/in) | pair→pair, contract over k | `layers/triangular_mult.py` | §4 | pair `(S0,S1)`→`(S0,S1)` | Cannon skew + `[S0,S1]↔[S1,S0]` | pair |
-| Triangle Attn (start/end) | attn over row/col of pair | `layers/triangular_attention.py` | §3 | pair + bias → pair | start: all-gather bias; end: transpose `[I/cp,J]↔[J,I/cp]`; tri-rotation | pair |
-| Outer Product Mean | single/MSA → pair | `layers/outer_product_mean.py` (`outer_op.py`) | §6 | MSA `(S1,R)` → pair | skew + reduce-scatter | pair |
-| Pair Weighted Averaging (PWA) | pair-weighted single update | `layers/pair_averaging.py` | §5 | single+pair → single `(S0,R)` | transpose + row/column Cannon ring | pair (weights) |
-| Attention Pair Bias (Ring) | attn w/ pair bias | `layers/attention.py` (`attention_impl.py`) | §7 | single q/k/v + pair bias → single | ring P2P of k/v+bias (`AttentionPairBiasComm`) | single + bias |
-| Attention Pair Bias (Shardwise) | attn w/ pair bias, shardwise bias | `layers/attention.py` (shardwise path) | §8 | single + shardwise bias → single | shardwise gather/reduce | single |
-| Transition | SwiGLU MLP | `layers/transition.py` | (within trunk) | single/pair → same | none (param-replicated `linear`) | matches input class |
-| Pairformer block | full trunk block | `layers/pairformer.py` | §3–§8 | single+pair → single+pair | composition of the above | pair |
-| Window batching / sliding-window gather | atom transformer windows | `layers/gather.py`, `outer_gather.py`, `scatter.py` (`GatherSlidingWindows`) | §9 | token→atom gather, atom→token scatter-reduce | interval-based P2P gather/scatter | O(window·N/cp0) |
+| Module | Serial role | 2D file | 1D file | § | In → Out placement | Collectives | Bwd budget |
+|---|---|---|---|---|---|---|---|
+| Triangle Mult (out/in) | pair→pair, contract over k | `layers/triangular_mult.py` | `triangular_mult_1d.py` | §4 | pair `(S0,S1)`→`(S0,S1)` / 1D `(S0,)`→`(S0,)` | 2D Cannon skew + `[S0,S1]↔[S1,S0]`; 1D ring rotation | pair |
+| Triangle Attn (start/end) | attn over row/col of pair | `layers/triangular_attention.py` | `triangular_attention_1d.py` | §3 | pair + bias → pair | start: all-gather bias; end: transpose `[I/cp,J]↔[J,I/cp]`; 2D tri-rotation | pair |
+| Outer Product Mean | single/MSA → pair | `layers/outer_product_mean.py` (`outer_op.py`) | `outer_product_mean_1d.py` (`outer_sum_1d.py`) | §6 | MSA `(S1,R)`/`(S1,)` → pair | 1D ring-rotate `b`; 2D skew + reduce-scatter | pair |
+| Pair Weighted Averaging (PWA) | pair-weighted single update | `layers/pair_averaging.py` | in `modules/msa_1d.py` | §5 | single+pair → single `(S0,R)`/`(S0,)` | 1D ring rotation | pair (weights) |
+| Attention Pair Bias (Ring) | attn w/ pair bias | `layers/attention.py` (`attention_impl.py`) | `attention_1d.py` | §7 | single q/k/v + pair bias → single | ring P2P of k/v+bias (`AttentionPairBiasComm`) | single + bias |
+| Attention Pair Bias (Shardwise) | attn w/ pair bias, shardwise bias | `layers/attention.py` (shardwise path) | `attention_1d.py` | §8 | single + shardwise bias → single | shardwise gather/reduce | single |
+| Transition | SwiGLU MLP | `layers/transition.py` | `transition_1d.py` | (within trunk) | single/pair → same | none (param-replicated `linear`) | matches input class |
+| Pairformer block | full trunk block | `layers/pairformer.py` | `pairformer_1d.py` | §3–§8 | single+pair → single+pair | composition of the above | pair |
+| Window batching / sliding-window gather | atom transformer windows | `layers/gather.py`, `outer_gather.py`, `scatter.py` (`GatherSlidingWindows`) | (1d paths) | §9 | token→atom gather, atom→token scatter-reduce | interval-based P2P gather/scatter | O(window·N/cp) |
 
 ## Module & model dictionary (tech guide §9–§11)
 
-| Module | Serial role | 2D file | § | Notes |
-|---|---|---|---|---|
-| Atom Encoder | token↔atom + window attn | `modules/encoders.py` (`_atom_encoder`) | §9 | canonical **composed** path (~50 utilities); pulls atom→token indices + masks from feats |
-| Token/Atom transformer | APB transformer | `modules/transformers.py` | §7–§8 | APB ring/shardwise |
-| Trunk (recycling) | recycle single+pair | `modules/trunkv2.py` | §3–§8 | broadcast recycle count across CP group (Rule 7) |
-| Diffusion | structure head | `modules/diffusion.py` | — | atom-level; sampling-step count broadcast across CP group |
-| Diffusion conditioning | trunk→diffusion conditioning | `modules/diffusion_conditioning.py` | — | — |
-| Confidence | pLDDT/PAE head | `modules/confidencev2.py` (`confidence_utils.py`) | §10 | own Pairformer stack; embeds predicted coords as distogram |
-| Top-level model | wires all of the above | `models/boltz2.py` | §2 | comm wiring via `DistributedManager` groups |
+| Module | Serial role | 2D file | 1D file | § | Notes |
+|---|---|---|---|---|---|
+| Atom Encoder | token↔atom + window attn | `modules/encoders.py` (`_atom_encoder`) | `encoders_1d.py` | §9 | canonical **composed** path (~50 utilities); pulls atom→token indices + masks from feats |
+| Token/Atom transformer | APB transformer | `modules/transformers.py` | — | §7–§8 | APB ring/shardwise |
+| Trunk (recycling) | recycle single+pair | `modules/trunkv2.py` | (1d) | §3–§8 | broadcast recycle count across CP group (Rule 7) |
+| Diffusion | structure head | `modules/diffusion.py` | `diffusion_1d.py` | — | atom-level; sampling-step count broadcast across CP group |
+| Diffusion conditioning | trunk→diffusion conditioning | `modules/diffusion_conditioning.py` | `diffusion_conditioning_1d.py` | — | — |
+| Confidence | pLDDT/PAE head | `modules/confidencev2.py` (`confidence_utils.py`) | `confidence_1d.py` | §10 | own Pairformer stack; embeds predicted coords as distogram; `cp>1` gated in 1D (`predict.py`) |
+| MSA stack (1D) | OPM+PWA+MSA merged | — | `modules/msa_1d.py` | §5–§6 | 1D consolidates OPM wrapper + PWA + MSA stack |
+| Top-level model | wires all of the above | `models/boltz2.py` | `boltz2_1d.py` | §2 | comm wiring via `DistributedManager` groups |
 
 ## Loss dictionary (tech guide §10–§11)
 
-| Loss | 2D file | § | Notes |
-|---|---|---|---|
-| Distogram | `loss/distogram.py` | §10 | canonical **fused** `autograd.Function` template (docstring documents budget) |
-| Confidence / pLDDT / PDE | `loss/confidencev2.py` | §10 | fused Triton `cdist_lddt`, `cdist_pde` |
-| Smooth LDDT | (composable) | §11 | — |
-| Diffusion | `loss/diffusion.py` | — | — |
-| B-factor | `loss/bfactor.py` | — | loss-level mean all-reduce over cp1 (replicate-axis drift mitigation) |
-| Validation (LDDT etc.) | `loss/validation.py`, `model/validation/` | — | metrics |
+| Loss | 2D file | 1D file | § | Notes |
+|---|---|---|---|---|
+| Distogram | `loss/distogram.py` | `distogram_1d.py` | §10 | canonical **fused** `autograd.Function` template (docstring documents budget) |
+| Confidence / pLDDT / PDE | `loss/confidencev2.py` | `confidence_1d.py` | §10 | fused Triton `cdist_lddt`, `cdist_pde` |
+| Smooth LDDT | (composable) | `loss/smooth_lddt_1d.py` | §11 | fused Triton fwd/bwd kernel |
+| Diffusion | `loss/diffusion.py` | `diffusion_1d.py` | — | — |
+| B-factor | `loss/bfactor.py` | `bfactor_1d.py` | — | loss-level mean all-reduce over cp1 (replicate-axis drift mitigation) |
+| Validation (LDDT etc.) | `loss/validation.py`, `model/validation/` | `rcsb_1d.py` | — | metrics |
 
 ## Implicit feature-container inputs (read this)
 
@@ -155,7 +162,7 @@ hang or a silent wrong result:
   a **transient peak-memory** blowup parity tests miss — keep intermediates in the intended
   dtype and verify peak with `/fold-cp:mem_profile`.
 - **Re-gather, don't save the gathered form** (Rule 11): if forward all-gathers a
-  bias/row, save only the O(N/cp0) shard and re-gather transiently in `backward` —
+  bias/row, save only the O(N/cp) shard and re-gather transiently in `backward` —
   saving the O(N²) gathered tensor blows the per-rank budget.
 - **Scatter/gather with `reduce="mean"`**: divide the backward gradient by `count`
   (clamped `min=1`) and clamp masked-out indices into range before `scatter_add_`.

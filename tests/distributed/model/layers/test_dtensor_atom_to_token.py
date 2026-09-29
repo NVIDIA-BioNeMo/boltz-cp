@@ -698,9 +698,9 @@ def assert_reconstruct_onehot_diag_block_global(
     backend: str,
     env_map: Optional[Dict[str, str]] = None,
 ):
-    """Validate all three reconstruct functions for diagonally-sharded one-hot DTensors.
+    """Validate all three reconstruct functions for sharded one-hot DTensors.
 
-    Tests:
+    Covers both 1D-CP (2D mesh) and 2D-CP (3D mesh) layouts.  Tests:
     1. reconstruct_atom_to_token_global — round-trip matches original global tensor and
        produces correct results when used with single_repr_token_to_atom.
     2. reconstruct_token_to_rep_atom_global — round-trip matches original global tensor.
@@ -715,10 +715,22 @@ def assert_reconstruct_onehot_diag_block_global(
     DistributedManager.initialize(grid_group_sizes, device_type=device_type, backend=backend)
     manager = DistributedManager()
 
-    size_cp = len(manager.group_ranks["cp"])
-    size_ring = isqrt(size_cp)
-    if size_ring * size_ring != size_cp:
-        raise ValueError(f"cp group size {size_cp} is not a square int")
+    cp_value = grid_group_sizes["cp"]
+    is_1d_cp = isinstance(cp_value, int)
+
+    if is_1d_cp:
+        # 1D-CP: 2D (dp, cp) mesh; size_ring is the flat cp size.
+        device_mesh: DeviceMesh = manager.device_mesh
+        size_cp = len(manager.group_ranks["cp"])
+        size_ring = size_cp
+    else:
+        # 2D-CP: 3D (dp, cp_axis_0, cp_axis_1) subgroup mesh; size_ring is
+        # the per-axis size of the square cp grid.
+        device_mesh = manager.device_mesh_subgroups
+        size_cp = len(manager.group_ranks["cp"])
+        size_ring = isqrt(size_cp)
+        if size_ring * size_ring != size_cp:
+            raise ValueError(f"cp group size {size_cp} is not a square int")
 
     batch_size = grid_group_sizes["dp"]
     n_tokens_per_rank = 4
@@ -730,44 +742,52 @@ def assert_reconstruct_onehot_diag_block_global(
     dim = 5
 
     seed_by_rank(0)
-    device_mesh: DeviceMesh = manager.device_mesh_subgroups
 
     dp_rank = device_mesh.get_coordinate()[0]
     dp_size = device_mesh.shape[0]
     local_batch = batch_size // dp_size
 
     # --- reconstruct_atom_to_token_global ---
-    token_repr_global = torch.randn(batch_size, n_tokens_global, dim, device=manager.device)
     atom_to_token_global = create_mock_atom_to_token_tensor(batch_size, n_tokens_global, n_atoms_global, size_ring).to(
         manager.device
     )
-
-    single_repr_placements = [Shard(dim=0), Shard(dim=1), Replicate()]
-    token_repr_dtensor = distribute_tensor(token_repr_global, device_mesh, single_repr_placements)
     atom_to_token_dtensor = create_atom_to_token_dtensor(atom_to_token_global, device_mesh)
 
     atom_to_token_reconstructed = reconstruct_atom_to_token_global(atom_to_token_dtensor)
     atom_to_token_dp_local = atom_to_token_global[dp_rank * local_batch : (dp_rank + 1) * local_batch]
     torch.testing.assert_close(atom_to_token_reconstructed, atom_to_token_dp_local)
 
-    result_dtensor = single_repr_token_to_atom(token_repr_dtensor, atom_to_token_dtensor)
-    result_full_local = result_dtensor.redistribute(
-        placements=[Shard(dim=0), Replicate(), Replicate()],
-    ).to_local()
-    token_repr_full_local = token_repr_dtensor.redistribute(
-        placements=[Shard(dim=0), Replicate(), Replicate()],
-    ).to_local()
-    expected_full_local = torch.bmm(
-        atom_to_token_reconstructed.to(dtype=token_repr_full_local.dtype),
-        token_repr_full_local,
-    )
-    torch.testing.assert_close(result_full_local, expected_full_local)
+    # The single_repr_token_to_atom bmm integration check only runs for 2D-CP
+    # because under 1D-CP the layer expects ``(Shard(0), Replicate())`` (a
+    # CP-replicated atom_to_token used post-reconstruction), which is a
+    # different placement convention than the sharded reconstruction input
+    # this test focuses on.
+    if not is_1d_cp:
+        token_repr_global = torch.randn(batch_size, n_tokens_global, dim, device=manager.device)
+        single_repr_placements = [Shard(dim=0), Shard(dim=1), Replicate()]
+        full_replicate_placements = [Shard(dim=0), Replicate(), Replicate()]
+        token_repr_dtensor = distribute_tensor(token_repr_global, device_mesh, single_repr_placements)
+
+        result_dtensor = single_repr_token_to_atom(token_repr_dtensor, atom_to_token_dtensor)
+        result_full_local = result_dtensor.redistribute(placements=full_replicate_placements).to_local()
+        token_repr_full_local = token_repr_dtensor.redistribute(placements=full_replicate_placements).to_local()
+        expected_full_local = torch.bmm(
+            atom_to_token_reconstructed.to(dtype=token_repr_full_local.dtype),
+            token_repr_full_local,
+        )
+        torch.testing.assert_close(result_full_local, expected_full_local)
 
     # --- reconstruct_token_to_rep_atom_global ---
     token_to_rep_atom_global = create_mock_token_to_rep_atom_tensor(
         batch_size, n_tokens_global, n_atoms_global, size_ring
     ).to(manager.device)
     token_to_rep_atom_dtensor = create_atom_to_token_dtensor(token_to_rep_atom_global, device_mesh)
+
+    # Sharding must be active along mesh dim 1 (token dim for this tensor).
+    expected_local_dim1 = n_tokens_global // size_ring
+    assert (
+        token_to_rep_atom_dtensor.to_local().shape[1] == expected_local_dim1
+    ), f"sharding inactive: local dim1 {token_to_rep_atom_dtensor.to_local().shape[1]} != {expected_local_dim1}"
 
     token_to_rep_atom_reconstructed = reconstruct_token_to_rep_atom_global(token_to_rep_atom_dtensor)
     token_to_rep_atom_dp_local = token_to_rep_atom_global[dp_rank * local_batch : (dp_rank + 1) * local_batch]
@@ -790,6 +810,8 @@ def assert_reconstruct_onehot_diag_block_global(
 @pytest.mark.parametrize(
     "setup_env",
     [
+        ((1, 2), True, "cuda", "ENV"),
+        ((2, 2), True, "cuda", "ENV"),
         ((1, (2, 2)), True, "cuda", "ENV"),
         ((2, (2, 2)), True, "cuda", "ENV"),
     ],
@@ -797,7 +819,7 @@ def assert_reconstruct_onehot_diag_block_global(
     ids=lambda x: f"dp:{x[0][0]}, cp:{x[0][1]}, specify_method:{x[1]}, device_type:{x[2]}, method_init:{x[3]}",
 )
 def test_reconstruct_onehot_diag_block_global(setup_env):
-    """Test all diagonal-block reconstruction functions: atom_to_token, token_to_rep_atom, r_set_to_rep_atom."""
+    """Test all sharded one-hot reconstruction functions across 1D-CP and 2D-CP meshes."""
     grid_group_sizes, world_size, device_type, backend, _, env_per_rank = setup_env
 
     if device_type == "cuda":

@@ -23,6 +23,11 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.placement_types import Replicate
 
+_SUPPORTED_MESH_DIM_NAMES = (
+    ("dp", "cp"),  # 1D CP: 2D mesh
+    ("dp", "cp_axis_0", "cp_axis_1"),  # 2D CP: 3D mesh
+)
+
 
 def gather_along_cp(dtensor: DTensor) -> Tensor:
     """Gather a DTensor over CP dimensions, keeping the DP shard, then unwrap to a plain Tensor.
@@ -30,6 +35,10 @@ def gather_along_cp(dtensor: DTensor) -> Tensor:
     Redistributes CP mesh dimensions (all except dim 0) to Replicate while
     preserving Shard(0) on the DP dimension. The returned tensor is the
     local DP slice with full spatial extent.
+
+    Supports both 1D-CP meshes (``("dp", "cp")``) and 2D-CP meshes
+    (``("dp", "cp_axis_0", "cp_axis_1")``); the rebuilt placements are
+    ``[Shard(0)] + [Replicate()] * (ndim - 1)`` in both cases.
 
     Parameters
     ----------
@@ -42,11 +51,10 @@ def gather_along_cp(dtensor: DTensor) -> Tensor:
     Tensor
         The CP-gathered plain tensor, local to this DP rank.
     """
-    expected_mesh_dim_names = ("dp", "cp_axis_0", "cp_axis_1")
-    if dtensor.device_mesh.mesh_dim_names != expected_mesh_dim_names:
+    mesh_dim_names = dtensor.device_mesh.mesh_dim_names
+    if mesh_dim_names not in _SUPPORTED_MESH_DIM_NAMES:
         raise ValueError(
-            "gather_along_cp expects device mesh dim names "
-            f"{expected_mesh_dim_names}, got {dtensor.device_mesh.mesh_dim_names}."
+            "gather_along_cp expects device mesh dim names in " f"{_SUPPORTED_MESH_DIM_NAMES}, got {mesh_dim_names}."
         )
     target_placements = [Shard(0)] + [Replicate()] * (dtensor.device_mesh.ndim - 1)
     gathered = dtensor.redistribute(dtensor.device_mesh, target_placements)

@@ -34,6 +34,9 @@ from boltz.data.module.trainingv2 import (
 from boltz.data.module.trainingv2 import DataConfigV2
 from boltz.data.pad import pad_dim
 from boltz.distributed.data.feature.featurizer import pad_and_scatter_atom_features_dtensor
+from boltz.distributed.data.module._error_propagation import (
+    rank_zero_fetch_with_propagation,
+)
 from boltz.distributed.data.module.placements import TRAINING_FEATURE_PLACEMENTS_V2
 from boltz.distributed.data.utils import (
     ATOM_FEATURES_V2,
@@ -239,6 +242,9 @@ class TrainingDatasetCPWithDTensorV2(_BaseDatasetCPWithDTensorV2):
 
         CP rank zero retrieves the sample from the serial dataset; all other
         CP ranks receive the distributed DTensor features via collectives.
+        Exceptions raised by the serial fetch on rank zero are propagated to
+        every CP rank via :func:`rank_zero_fetch_with_propagation` so peers
+        do not deadlock in the subsequent broadcast.
 
         Parameters
         ----------
@@ -251,7 +257,13 @@ class TrainingDatasetCPWithDTensorV2(_BaseDatasetCPWithDTensorV2):
             Distributed feature dictionary with DTensor values.
 
         """
-        features = self.serial_dataset[idx] if self.is_cp_rank_zero else None
+        cp_group_src_rank_global = min(torch.distributed.get_process_group_ranks(self._cp_submesh_group))
+        features = rank_zero_fetch_with_propagation(
+            fetch_fn=lambda: self.serial_dataset[idx],
+            is_cp_rank_zero=self.is_cp_rank_zero,
+            cp_group=self._cp_submesh_group,
+            cp_group_src_rank_global=cp_group_src_rank_global,
+        )
         return self._distribute_features(features)
 
 
@@ -317,7 +329,8 @@ class ValidationDatasetCPWithDTensorV2(_BaseDatasetCPWithDTensorV2):
             If every sample in the dataset is filtered out by the thresholds.
 
         """
-        if self.is_cp_rank_zero:
+
+        def _scan_for_valid_sample() -> dict[str, Any]:
             num_items = len(self.serial_dataset)
             for shift in range(num_items):
                 curr_idx = (idx + shift) % num_items
@@ -336,12 +349,16 @@ class ValidationDatasetCPWithDTensorV2(_BaseDatasetCPWithDTensorV2):
                     seqs = int((msa_mask.sum(dim=1) > 0).sum().item()) if msa_mask.ndim == 2 else int(msa_mask.shape[0])
                     if seqs > self.val_skip_sample_threshold_seqs:
                         continue
-                break
-            else:
-                raise RuntimeError("All validation samples were filtered out by val_skip_sample_threshold_*")
-        else:
-            features = None
+                return features
+            raise RuntimeError("All validation samples were filtered out by val_skip_sample_threshold_*")
 
+        cp_group_src_rank_global = min(torch.distributed.get_process_group_ranks(self._cp_submesh_group))
+        features = rank_zero_fetch_with_propagation(
+            fetch_fn=_scan_for_valid_sample,
+            is_cp_rank_zero=self.is_cp_rank_zero,
+            cp_group=self._cp_submesh_group,
+            cp_group_src_rank_global=cp_group_src_rank_global,
+        )
         return self._distribute_features(features)
 
 

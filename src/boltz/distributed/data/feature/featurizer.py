@@ -596,9 +596,17 @@ def pack_atom_features(
                     )
                 n_tokens_per_shard = atom_to_token_dt.to_local().shape[2]
                 atom_to_token_ids_local = shardwise_argmax(atom_to_token_dt, dim=-1, keepdim=False)
-                # 2. Convert to global indices
+                # 2. Convert to global indices.
+                # 2D-CP (3D mesh): local one-hot is block-diagonal [..., N_tokens_per_shard],
+                #   so argmax yields shard-local indices that need `rank * N_per_shard` offset.
+                # 1D-CP (2D mesh): local one-hot spans the full token dim [..., N_tokens_global],
+                #   so argmax already yields GLOBAL indices — no offset needed (offset_per_rank=0).
+                if atom_to_token_dt.device_mesh.ndim == 2:
+                    offset_per_rank = 0
+                else:
+                    offset_per_rank = n_tokens_per_shard
                 atom_to_token_ids_global = shardwise_offset(
-                    atom_to_token_ids_local, dim=1, offset_per_rank=n_tokens_per_shard
+                    atom_to_token_ids_local, dim=1, offset_per_rank=offset_per_rank
                 )
                 # 3. Pack the global indices (not the one-hot matrix)
                 mask_for_ids = atom_mask_dt

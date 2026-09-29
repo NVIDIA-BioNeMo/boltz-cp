@@ -5,10 +5,10 @@ description: >
   Inventories local GPUs (count, model, memory, NVLink topology), checks the
   software stack (Python, PyTorch+CUDA, NCCL, torch.distributed), and runs shipped
   smoke tests for batch_isend_irecv P2P, all_gather, all_reduce, reduce_scatter,
-  and a DTensor round-trip. Maps the GPU count to whether 2D CP is testable
-  (2D needs >=4 GPUs; full integration wants 8). When insufficient local GPUs
-  are available, generates a SLURM submission template and guides the user to
-  provide cluster access. Records docs/cp_infra.md. Use after
+  and a DTensor round-trip. Maps the GPU count to which CP topologies are testable
+  (2D needs >=4 GPUs, 1D needs >=2 ideally 3, full integration wants 8). When no
+  local GPUs are available, generates a SLURM submission template and guides the
+  user to provide cluster access. Records docs/cp_infra.md. Use after
   learn_context, before shard_data_feats / dtensor_modules / test.
 argument-hint: "[--local | --slurm] [requested world size]"
 ---
@@ -17,7 +17,7 @@ argument-hint: "[--local | --slurm] [requested world size]"
 
 CP code cannot be developed or trusted without multi-GPU execution. This skill
 proves the environment can run the collectives CP depends on, and decides which CP
-configurations are testable here. Run the shipped scripts; do not hand-wave the
+topologies are testable here. Run the shipped scripts; do not hand-wave the
 checks. All scripts live in [`scripts/`](scripts) under this skill
 (`${CLAUDE_SKILL_DIR}/scripts`).
 
@@ -32,15 +32,27 @@ nvidia-smi topo -m                              # NVLink / PCIe topology
 Note which GPUs are **free** (other users may occupy a shared node — respect
 `manage_gpu` hygiene if available: never use a GPU you did not claim).
 
-## Step 2 — Map free GPUs to testable 2D-CP configurations
+## Step 2 — Map free GPUs to testable CP topologies
 
-| Free GPUs | 2D-CP | Integration |
-|---|---|---|
-| **>=8** | yes — `cp0=cp1=2` (+ `dp>=2`) | full end-to-end |
-| **4–7** | yes — `cp0=cp1=2` | limited |
-| **0–3** | no (needs a perfect square >=4) | escalate to SLURM (Step 5) |
+| Free GPUs | 2D-CP (supported) | 1D-CP (experimental) | Integration |
+|---|---|---|---|
+| **>=8** | yes — `cp0=cp1=2` (+ `dp>=2`) | yes — `cp` up to 8 | full end-to-end |
+| **4–7** | yes — `cp0=cp1=2` | yes | limited |
+| **3** | no (needs perfect square >=4) | yes — `cp=3` (also covers non-power-of-two) | no |
+| **2** | no | yes — `cp=2` (minimum) | no |
+| **0–1** | no | no | escalate to SLURM (Step 5) |
 
-2D-CP requires `size_cp` to be a perfect square (`cp0=cp1`); the smallest is 4.
+2D-CP requires `size_cp` a perfect square (`cp0=cp1`); the smallest is 4. **2D is the supported,
+default topology.** 1D-CP runs at any `cp>=1` (`cp=3` also exercises non-power-of-two sharding), but
+**1D-CP is EXPERIMENTAL — known pending bugs, unestablished inference-set / training-curve parity, and
+paths gated at `cp>1` (e.g. confidence).**
+
+> **1D-CP gate (Rule 25).** Whenever 1D is the chosen topology — the user asked for it, **or** the box
+> has <4 free GPUs / cannot form a perfect-square mesh so only 1D is feasible — **before recording it in
+> `cp_infra.md`**: (a) warn the user plainly that 1D is experimental with pending bugs; (b) pause for a
+> one-time at-own-risk `AskUserQuestion` (*proceed with 1D at my own risk* / *switch to 2D — get ≥4 GPUs
+> for a square mesh* / *abort*); (c) record the acknowledgement in `cp_infra.md`. Prefer 2D whenever the
+> hardware allows it. This sign-off is required even when a caller runs in `--automatic` mode.
 
 Record the chosen config(s).
 
@@ -96,8 +108,8 @@ not a hard gate — the real gates are the smoke tests (Step 4).
   artifacts (a large model or many checkpoints can need more). `probe_env.py` reports free/total
   and warns under the threshold; it is a recommendation, not a hard stop.
 - **Per-step hardware (R10) is runtime-derived, not a fixed table.** GPU **count → testable
-  configuration** comes from Step 2 (2D needs a perfect square ≥4); **per-module memory
-  budgets** come from `/fold-cp:dtensor_modules` (the O(N/cp0) / O(N²/(cp0·cp1)) backward budget)
+  topology** comes from Step 2 (2D needs a perfect square ≥4; 1D needs ≥2); **per-module memory
+  budgets** come from `/fold-cp:dtensor_modules` (the O(N/cp) / O(N²/(cp0·cp1)) backward budget)
   and are measured by `/fold-cp:mem_profile`; **training vs inference** differ only by fwd vs
   fwd+bwd+step, captured by `/fold-cp:benchmark` on the *same* mesh. Record the SKU you actually
   ran on in `cp_infra.md` as provenance — do not prescribe one.
@@ -117,15 +129,15 @@ timeout 120 python "${CLAUDE_SKILL_DIR}/scripts/test_dtensor_smoke.py" --world-s
   `all_reduce`, and `reduce_scatter` against analytic expected values on every
   rank. A hang here means NCCL/IB misconfiguration — diagnose before proceeding.
 - `test_dtensor_smoke.py` — builds a `DeviceMesh`, `distribute_tensor`, checks
-  `to_local()` shapes and a `full_tensor()` round-trip for a 2D square-tile
-  placement. This proves the DTensor substrate works here.
+  `to_local()` shapes and a `full_tensor()` round-trip, and (when `WS` is a perfect
+  square) a 2D square-tile placement. This proves the DTensor substrate works here.
 
 If a test hangs to the timeout, treat it as a hard failure (likely a deadlock or
 transport problem), capture `NCCL_DEBUG=INFO` output, and resolve before moving on.
 
 ## Step 5 — No local GPUs: escalate to a cluster (SLURM)
 
-If Step 2 yields fewer than 4 GPUs, CP cannot be tested locally. Then:
+If Step 2 yields 0–1 GPUs, CP cannot be tested locally. Then:
 
 1. Ask the user for cluster access details: login/submission host, scheduler
    (SLURM assumed), partition/queue, account, time limit, the module/conda
@@ -140,7 +152,7 @@ If Step 2 yields fewer than 4 GPUs, CP cannot be tested locally. Then:
 
 ## Step 6 — Record the deliverable
 
-Write `docs/cp_infra.md` with: the GPU inventory, the chosen testable 2D-CP config(s)
+Write `docs/cp_infra.md` with: the GPU inventory, the chosen testable CP config(s)
 and `world_size`, software versions, the **resource prerequisites** (free disk vs the
 ~150 GB recommendation, NVIDIA driver vs torch's CUDA build, and the
 self-consistency verdict from the section above), smoke-test results (paths to the

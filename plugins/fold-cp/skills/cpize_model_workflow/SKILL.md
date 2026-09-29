@@ -10,7 +10,7 @@ description: >
   benchmark. Use as the front door when the user wants to "CP-ify my model" as a whole program
   of work — it prioritizes, sequences, and gates the long task list and delegates each task to
   the right fold-cp skill. Not for a single module (use dtensor_modules + test directly).
-argument-hint: "[scope] [focus] [dp:N cp:(A,B)] [model:path] [ref:path] [--local|--slurm] [data:path|--random] [--automatic|--manual-approve] [resume]"
+argument-hint: "[scope] [focus] [dp:N cp:(A,B)|cp:N] [model:path] [ref:path] [--local|--slurm] [data:path|--random] [--automatic|--manual-approve] [resume]"
 ---
 
 # cpize_model_workflow — conduct the whole CP integration, prioritized and gated
@@ -46,8 +46,8 @@ The orchestrator **owns only** the plan, the ordering, the gates, and the ledger
 | token | input | default |
 |---|---|---|
 | `inference` / `training` / `all` | **scope** (which workflow) | `all` |
-| `dp:<d>` `cp:(<a>,<b>)` | **2D mesh config** (see below) | from `cp_infra.md` |
-| bare `2d` | **topology** hint only (sizes deferred to `build_infra`) | from the `cp:` shape |
+| `dp:<d>` `cp:(<a>,<b>)` / `cp:<n>` | **mesh config** (see below) | from `cp_infra.md` |
+| bare `1d` / `2d` | **topology** hint only (sizes deferred to `build_infra`) | from the `cp:` shape |
 | `model:<path>` | the **user's model code** | resolve by tracing |
 | `ref:<path>` | the **reference repo** (`$BOLTZ_CP_REPO`) | `$BOLTZ_CP_REPO` env / search |
 | `--local` / `--slurm` | **launch environment** | `build_infra` decides |
@@ -64,19 +64,23 @@ The orchestrator **owns only** the plan, the ordering, the gates, and the ledger
   autonomously (a red gate → [re-prioritize](#re-prioritize-on-failure--resume), never stop,
   Rule 3; a design fork → sensible default, recorded). `--manual-approve` pauses at every wave
   boundary for approval. **Full semantics — automatic vs manual behavior, the critical-blocker
-  list (the only halts allowed under `--automatic`), and the per-call permission caveat — are in
-  [reference.md](reference.md#execution-mode-detail).**
+  list (the only halts allowed under `--automatic`), the 1D-CP sign-off exception, and the
+  per-call permission caveat — are in [reference.md](reference.md#execution-mode-detail).**
 - **Reference repo (`$BOLTZ_CP_REPO`)** — the Boltz-CP implementation every mapping cites. Resolve
   it first (env var → `ref:<path>` → search); phase-0 `learn_context` prompts if unset. Record it
   in the ledger — *the whole workflow is undefined without it.* The **model path** (`model:<path>`)
   and **scope** feed phase-0 `learn_context`; the **launch** flag feeds phase-1 `build_infra`.
-- **Mesh config — the concrete 2D device mesh used to TEST, BENCHMARK, and PROFILE.**
-  `dp:<d> cp:(<cp0>,<cp1>)`; `dp` defaults to 1,
-  `world_size = dp · cp0 · cp1` (mechanics + threading in
+- **Mesh config — the concrete device mesh used to TEST, BENCHMARK, and PROFILE.**
+  `dp:<d> cp:(<cp0>,<cp1>)` (2D) or `dp:<d> cp:<n>` (1D); `dp` defaults to 1,
+  `world_size = dp · ∏cp` (mechanics + threading in
   [reference.md](reference.md#run-inputs-front-door-arguments)). It is the single mesh threaded
   to every parity test (phases 2–5), the benchmark (phase 7), and the profiles (phase 6), and it
   sets the Step-4 slot bound (`slots = floor(free_GPUs / world_size)`). Absent ⇒ `build_infra`
-  picks a feasible 2D mesh.
+  picks a feasible mesh. **If `cp` resolves to 1D — a scalar `cp:<n>`, or `build_infra` reports
+  only 1D is feasible (<4 GPUs / non-square) — apply the 1D-CP experimental gate (Rule 25) before
+  Step 2: warn that 1D has pending bugs / unestablished parity, take a one-time at-own-risk
+  `AskUserQuestion` (proceed-1D / switch-to-2D / abort), and record it in the ledger. Required
+  even under `--automatic`; 2D is the default and is not gated.**
 - **Data source** (`data:<path>` | `--random`) decides whether the parity/e2e tests and the
   benchmark use real features or synthesized ones (the test skill synthesizes when none is given).
 - **Focus area** (optional) names a model **subsystem or module to CP-ify first**
@@ -195,7 +199,7 @@ model is meaningless, so phase 6 does not start until phase 5 is green.
 Run `/fold-cp:mem_profile`, then `/fold-cp:nsys_profile` (they may overlap if GPUs allow). Read
 them **against the rules**, not just for numbers:
 
-- **Memory:** per-rank peak must match the forward+backward budget (Rule 11 — single O(N/cp0),
+- **Memory:** per-rank peak must match the forward+backward budget (Rule 11 — single O(N/cp),
   pair O(N²/(cp0·cp1))). Watch the **transient recompute peak** (activation checkpointing moves
   the ceiling into recompute) and an **unintended dtype up-cast** inside an `autograd.Function`
   (Rule 19) — both pass parity but surface here.

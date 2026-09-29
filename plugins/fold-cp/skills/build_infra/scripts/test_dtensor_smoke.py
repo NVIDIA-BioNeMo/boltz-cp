@@ -22,9 +22,11 @@
 """DTensor substrate smoke test, self-launched with mp.spawn.
 
 Proves the DTensor machinery CP is built on works in this environment:
-  * 2D mesh: square-tile a pair-like [N, N] tensor as
-    (Shard(0), Shard(1)); check the local tile shape and a full_tensor()
-    round-trip against the known global tensor.
+  * 1D mesh: distribute a tensor as Shard(0); check to_local() shard shape and a
+    full_tensor() round-trip against the known global tensor.
+  * 2D mesh (only when world_size is a perfect square): square-tile a pair-like
+    [N, N] tensor as (Shard(0), Shard(1)); check the local tile shape and the
+    full_tensor() round-trip.
 
 Usage:
     timeout 120 python test_dtensor_smoke.py --world-size 4
@@ -61,26 +63,47 @@ def worker(rank: int, world_size: int, backend: str, port: int, device_type: str
     if device_type == "cuda":
         torch.cuda.set_device(rank % torch.cuda.device_count())
 
+    gen = torch.Generator().manual_seed(0)  # identical global tensor on every rank
+
+    # --- 1D mesh: Shard(0) ---------------------------------------------------
+    mesh1d = init_device_mesh(device_type, (world_size,), mesh_dim_names=("cp",))
+    n = world_size * 4
+    glob = torch.randn(n, 8, generator=gen)
+    if device_type == "cuda":
+        glob = glob.cuda()
+    dt = distribute_tensor(glob, mesh1d, [Shard(0)])
+    local = dt.to_local()
+    assert local.shape[0] == n // world_size, f"[rank {rank}] 1D shard rows {local.shape[0]} expected {n // world_size}"
+    assert local.shape[0] < glob.shape[0], "[rank] sharding not active on dim 0"
+    full = dt.full_tensor()
+    assert torch.allclose(full, glob), f"[rank {rank}] 1D full_tensor round-trip mismatch"
+
     # --- 2D mesh: square tile (Shard(0), Shard(1)) ---------------------------
     sq = int(math.isqrt(world_size))
-    mesh2d = init_device_mesh(device_type, (sq, sq), mesh_dim_names=("cp0", "cp1"))
-    m = sq * 4
-    gen = torch.Generator().manual_seed(1)
-    pair = torch.randn(m, m, generator=gen)
-    if device_type == "cuda":
-        pair = pair.cuda()
-    dt2 = distribute_tensor(pair, mesh2d, [Shard(0), Shard(1)])
-    tile = dt2.to_local()
-    assert tile.shape == (
-        m // sq,
-        m // sq,
-    ), f"[rank {rank}] 2D tile {tuple(tile.shape)} expected {(m // sq, m // sq)}"
-    full2 = dt2.full_tensor()
-    assert torch.allclose(full2, pair), f"[rank {rank}] 2D full_tensor round-trip mismatch"
+    if sq * sq == world_size and sq >= 2:
+        mesh2d = init_device_mesh(device_type, (sq, sq), mesh_dim_names=("cp0", "cp1"))
+        m = sq * 4
+        gen2 = torch.Generator().manual_seed(1)
+        pair = torch.randn(m, m, generator=gen2)
+        if device_type == "cuda":
+            pair = pair.cuda()
+        dt2 = distribute_tensor(pair, mesh2d, [Shard(0), Shard(1)])
+        tile = dt2.to_local()
+        assert tile.shape == (
+            m // sq,
+            m // sq,
+        ), f"[rank {rank}] 2D tile {tuple(tile.shape)} expected {(m // sq, m // sq)}"
+        full2 = dt2.full_tensor()
+        assert torch.allclose(full2, pair), f"[rank {rank}] 2D full_tensor round-trip mismatch"
+        two_d = True
+    else:
+        two_d = False
 
     dist.barrier()
     if rank == 0:
-        print(f"OK: DTensor 2D square-tile (Shard(0),Shard(1)) " f"verified on all {world_size} ranks.")
+        msg = "OK: DTensor 1D Shard(0)"
+        msg += " + 2D square-tile (Shard(0),Shard(1))" if two_d else " (2D skipped: world_size not a perfect square)"
+        print(f"{msg} verified on all {world_size} ranks.")
     dist.destroy_process_group()
 
 
@@ -90,13 +113,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=29556)
     args = ap.parse_args()
 
-    sq = math.isqrt(args.world_size)
-    if sq < 2 or sq * sq != args.world_size:
-        raise SystemExit("world_size must be a perfect square >= 4 for the 2D DTensor smoke test")
-
     use_cuda = torch.cuda.is_available()
     if use_cuda and torch.cuda.device_count() < args.world_size:
-        raise SystemExit(f"world_size={args.world_size} but only " f"{torch.cuda.device_count()} CUDA devices visible.")
+        raise SystemExit(f"world_size={args.world_size} but only {torch.cuda.device_count()} CUDA devices visible.")
     device_type = "cuda" if use_cuda else "cpu"
     backend = "nccl" if use_cuda else "gloo"
     mp.spawn(

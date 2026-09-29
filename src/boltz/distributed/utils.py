@@ -25,6 +25,7 @@ from typing import Callable, Iterable, List, Self, Sequence
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import DeviceMesh
@@ -1159,3 +1160,17 @@ def update_exhaustive_strides(
     strides_new_ascending = np.concatenate(([1], shape_new_ascending[:-1])).cumprod()
     strides_new = strides_new_ascending[argsort_output]
     return tuple(strides_new.tolist())
+
+
+def all_gather_on_cp(
+    tensor: torch.Tensor,
+    dim: int,
+    cp_group: dist.ProcessGroup,
+    cp_size: int,
+) -> torch.Tensor:
+    """All-gather a tensor along the cp group on the specified dimension."""
+    if cp_size == 1:
+        return tensor
+    gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
+    dist.all_gather(gathered, tensor.contiguous(), group=cp_group)
+    return torch.cat(gathered, dim=dim)

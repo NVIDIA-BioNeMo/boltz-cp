@@ -20,7 +20,6 @@
 # DEALINGS IN THE SOFTWARE.
 
 
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -54,6 +53,7 @@ from boltz.distributed.model.modules.utils import PRECISION_TO_DTYPE, Precision,
 from boltz.model.loss.diffusion import smooth_lddt_loss as smooth_lddt_loss_ref_impl_v1
 from boltz.model.loss.diffusionv2 import smooth_lddt_loss as smooth_lddt_loss_ref_impl_v2
 from boltz.testing.utils import spawn_multiprocessing
+from tests.distributed.model.loss.triton_test_utils import get_triton_ptxas_path
 
 
 def assert_smooth_lddt_loss_equivalence(rank, payload):
@@ -435,7 +435,7 @@ def assert_no_register_spilling(path_to_ptx_file: Path):
     # Run ptxas
     # -v: Verbose (prints register/spill stats)
     # --gpu-name=sm_{arch}: Matches target hardware
-    ptxas_path = os.environ["TRITON_PTXAS_PATH"]
+    ptxas_path = get_triton_ptxas_path(sm_arch)
 
     cmd = [ptxas_path, "-v", f"--gpu-name={sm_arch}", str(path_to_ptx_file)]
 
@@ -480,10 +480,6 @@ def test_no_register_spilling(tmp_path, monkeypatch, precision, fwd_or_bwd, B, M
     # Ensure cache dir is unique to avoid hitting cached kernels without dump
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "cache"))
-    # NOTE: the ptxas version must be recent enough to support the running GPU architecture
-    # either wise the ptxas call later will fail
-    monkeypatch.setenv("TRITON_PTXAS_PATH", os.environ.get("TRITON_PTXAS_PATH", "ptxas"))
-
     # invoke the kernel to get the ptx code
     D = 3
 

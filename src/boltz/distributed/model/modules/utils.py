@@ -432,7 +432,7 @@ class TriAttnBackend(Enum):
 
 
 class SetTriAttnBackend:
-    """Callable that sets ``triattn_backend`` on every :class:`PairformerLayer` in a model.
+    """Callable that sets ``triattn_backend`` on every :class:`PairformerLayer` and :class:`PairformerLayer1D` in a model.
 
     Designed for use with :meth:`torch.nn.Module.apply`::
 
@@ -448,6 +448,7 @@ class SetTriAttnBackend:
         # Lazy import: PairformerLayer imports TriAttnBackend from this module,
         # so a top-level import would create a circular dependency.
         from boltz.distributed.model.layers.pairformer import PairformerLayer
+        from boltz.distributed.model.layers.pairformer_1d import PairformerLayer1D
 
         valid = (
             TriAttnBackend.REFERENCE,
@@ -458,7 +459,7 @@ class SetTriAttnBackend:
         if triattn_backend not in valid:
             raise ValueError(f"triattn_backend must be one of {valid} but got {triattn_backend}")
         self.triattn_backend = triattn_backend
-        self.supported_module_types = (PairformerLayer,)
+        self.supported_module_types = (PairformerLayer, PairformerLayer1D)
 
     def __call__(self, module: torch.nn.Module) -> None:
         if not isinstance(module, self.supported_module_types):
@@ -486,15 +487,16 @@ class SetAttnPairBiasBackend:
         # Lazy import: attention.py imports from this module, so a top-level
         # import would create a circular dependency.
         from boltz.distributed.model.layers.attention import AttentionPairBias
+        from boltz.distributed.model.layers.attention_1d import AttentionPairBias1D
 
         valid = (SDPAWithBiasBackend.REFERENCE, SDPAWithBiasBackend.TORCH_FLEX_ATTN)
         if sdpa_with_bias_backend not in valid:
             raise ValueError(f"sdpa_with_bias_backend must be one of {valid} but got {sdpa_with_bias_backend}")
         self.sdpa_with_bias_backend = sdpa_with_bias_backend
-        self._target_type = AttentionPairBias
+        self._target_types = (AttentionPairBias, AttentionPairBias1D)
 
     def __call__(self, module: torch.nn.Module) -> None:
-        if not isinstance(module, self._target_type):
+        if not isinstance(module, self._target_types):
             return
         if not hasattr(module, "sdpa_with_bias_backend"):
             raise AttributeError(

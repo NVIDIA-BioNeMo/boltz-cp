@@ -27,7 +27,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import Tensor
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from boltz.data.module.trainingv2 import DataConfigV2
 
@@ -37,32 +37,63 @@ CONFIG_FILE_BASE = ROOT_DIR / "scripts" / "train" / "configs" / "structurev2.yam
 
 
 def create_atom_to_token_dtensor(atom_to_token_global: Tensor, device_mesh: DeviceMesh) -> DTensor:
-    """Create a distributed tensor for atom_to_token with proper placement.
+    """Create a distributed ``atom_to_token`` DTensor matching the production featurizer layout.
+
+    Two mesh topologies are supported, each with its own production layout:
+
+    * 2D mesh (1D CP: ``(dp, cp)``) — atom dim sharded on ``cp``, token dim
+      replicated.  Placement: ``(Shard(0), Shard(1))``.  Each rank's local
+      tensor has full global token width (``local.shape[2] == n_tokens``).
+      This matches ``placements_1d.py`` (``PLACEMENT_1D_ATOM = (Shard(0),)``
+      on the cp sub-mesh) and the ``device_mesh.ndim == 2`` branch in
+      ``featurizer.py`` ``pack_atom_features`` which assumes the local one-hot
+      already spans the full global token dim (``offset_per_rank = 0``).
+      It is also the layout validated by
+      ``reconstruct_atom_to_token_global`` for 2D meshes.
+    * 3D mesh (2D CP: ``(dp, cp_axis_0, cp_axis_1)``) — pre-padded
+      diagonal-block layout: each ``(cp_axis_0, cp_axis_1)`` rank holds the
+      diagonal block at that index, and the global shape exposed to DTensor
+      uses per-shard token width.  Placement:
+      ``(Shard(0), Shard(1), Replicate())``.  This matches the existing
+      2D-CP data-pipeline co-sharding strategy.
 
     Args:
-        atom_to_token_global: Global atom_to_token tensor of shape (B, n_atoms, n_tokens)
-        device_mesh: DeviceMesh instance
+        atom_to_token_global: Global atom_to_token tensor of shape
+            ``(B, n_atoms, n_tokens)``.
+        device_mesh: DeviceMesh with ``ndim`` of either 2 or 3.
 
     Returns:
-        DTensor: Distributed atom_to_token tensor with placement (Shard(0), Shard(1), Replicate())
+        DTensor: Distributed atom_to_token tensor matching the production
+        featurizer placement for the given mesh dimensionality.
     """
-    # Get block diagonal chunk of atom_to_token_global
+    mesh_ndim = device_mesh.ndim
+    if mesh_ndim == 2:
+        # 1D-CP: atom dim sharded on cp, token dim replicated; local shape
+        # is (B/dp, n_atoms/cp, n_tokens_global).
+        return distribute_tensor(atom_to_token_global, device_mesh, (Shard(0), Shard(1)))
+    if mesh_ndim != 3:
+        raise ValueError(f"create_atom_to_token_dtensor: expected device_mesh.ndim in {{2, 3}}, got {mesh_ndim}")
+
+    # 2D-CP (3D mesh): build the diagonal-block local view and pass placements
+    # (Shard(0), Shard(1), Replicate()).
+    from boltz.distributed.model.layers.atom_to_token import _single_repr_placements
+
     n_atoms, n_tokens = atom_to_token_global.shape[1:]
-    cp_axis_0_size = device_mesh.get_group("cp_axis_0").size()
+    # Mesh dim 1 is the primary CP axis (cp_axis_0) for 3D meshes.
+    cp_primary_size = device_mesh.size(1)
 
     atom_to_token_local = []
-    for cp_idx in range(cp_axis_0_size):
-        start_token_idx = cp_idx * n_tokens // cp_axis_0_size
-        end_token_idx = (cp_idx + 1) * n_tokens // cp_axis_0_size
-        start_atom_idx = cp_idx * n_atoms // cp_axis_0_size
-        end_atom_idx = (cp_idx + 1) * n_atoms // cp_axis_0_size
+    for cp_idx in range(cp_primary_size):
+        start_token_idx = cp_idx * n_tokens // cp_primary_size
+        end_token_idx = (cp_idx + 1) * n_tokens // cp_primary_size
+        start_atom_idx = cp_idx * n_atoms // cp_primary_size
+        end_atom_idx = (cp_idx + 1) * n_atoms // cp_primary_size
         atom_to_token_local.append(atom_to_token_global[:, start_atom_idx:end_atom_idx, start_token_idx:end_token_idx])
 
     atom_to_token_local = torch.cat(atom_to_token_local, dim=1)
 
-    placements = (Shard(dim=0), Shard(dim=1), Replicate())
-    atom_to_token_dtensor = distribute_tensor(atom_to_token_local, device_mesh, placements)
-    return atom_to_token_dtensor
+    placements = _single_repr_placements(mesh_ndim)
+    return distribute_tensor(atom_to_token_local, device_mesh, placements)
 
 
 def setup_mock_training_datamodule_config(test_data_dir: Path) -> DataConfigV2:
